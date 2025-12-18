@@ -1,0 +1,58 @@
+# Monorepo ignores for Django backend + Next.js frontend
+# See https://help.github.com/articles/ignoring-files/
+
+# --------------------
+# Frontend (Next.js)
+# --------------------
+/frontend/node_modules
+/frontend/.next/
+/frontend/out
+/frontend/.vercel
+/frontend/coverage
+/frontend/next-env.d.ts
+/frontend/tsconfig.tsbuildinfo
+
+# --------------------
+# Backend (Django/Python)
+# --------------------
+/venv
+/backend/venv
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+
+# --------------------
+# Build outputs
+# --------------------
+/build
+
+# --------------------
+# Logs
+# --------------------
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --------------------
+# OS
+# --------------------
+.DS_Store
+
+# --------------------
+# Yarn/PNP
+# --------------------
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# --------------------
+# Environment files
+# --------------------
+*.env
+*.env.local

@@ -1,0 +1,12 @@
+django>=5.0
+djangorestframework
+channels
+daphne
+aiortc
+av
+numpy
+asgiref
+wcwidth
+django-cors-headers
+jsonschema
+python-dotenv
