@@ -1,56 +1,55 @@
-﻿## AI Coding Agent Instructions
+﻿# AI Coding Agent Instructions
 
-**Project**: One-on-one AI video conferencing. Django 5.2 + Channels/Daphne + aiortc backend; Next.js 16 / React 19 frontend. Default AI is mock; Groq LLM + Sarvam/Whisper STT + Coqui TTS are wired for live mode.
+Project: One-on-one AI video conferencing. Backend: Django 5.2 + Channels/Daphne + aiortc; Frontend: Next.js 16 / React 19. Mock mode works out of the box; live providers (Groq LLM, Sarvam/Whisper STT, Coqui TTS) are wired.
 
-### Quick Start
-**Windows**: `./setup.ps1` | **Linux/macOS**: `chmod +x setup.sh && ./setup.sh`
-
-Then in separate terminals:
-- Backend: `cd backend && daphne -p 8000 config.asgi:application` (ASGI required for WebRTC)
-- Frontend: `cd frontend && npm run dev`
+## Quick Start
+- Windows: `./setup.ps1`
+- Linux/macOS: `chmod +x setup.sh && ./setup.sh`
+- Run backend (ASGI required): `cd backend && daphne -p 8000 config.asgi:application`
+- Run frontend: `cd frontend && npm run dev`
 - Visit: http://localhost:3000/dashboard (login required)
+- Env: `NEXT_PUBLIC_API_URL=http://localhost:8000`, `AI_MODE=mock|live`, `STT_PROVIDER=sarvam|whisper|groq`
 
-Key env vars: `NEXT_PUBLIC_API_URL=http://localhost:8000`, `AI_MODE=mock|live`, `STT_PROVIDER=sarvam|whisper|groq`
+## Architecture Overview
+- **ConversationPhase Controller**: Single source-of-truth and turn-taking gate in [backend/ai_agent/conversation.py](../backend/ai_agent/conversation.py) with phases: `GREETING`, `WAIT_FOR_USER`, `PROCESSING_USER`, `AI_SPEAKING`. Holds `expected_user_utterance_id`, drops stale VAD.
+- **AIOrchestrator**: STT/LLM/TTS glue in [backend/ai_agent/ai_orchestrator.py](../backend/ai_agent/ai_orchestrator.py). Keeps per-room history (20 turns), builds prompts, truncates LLM replies.
+- **WebRTCManager**: Peer connection + audio I/O in [backend/ai_agent/webrtc.py](../backend/ai_agent/webrtc.py). Applies incoming VAD; streams TTS via `queue_audio_output` (20ms/1920-byte chunks) and sets `ai_is_speaking` to mute VAD.
+- **Signaling**: Django Channels consumer at `/ws/signaling/{room_id}/` via [backend/ai_agent/routing.py](../backend/ai_agent/routing.py) and [backend/ai_agent/consumers.py](../backend/ai_agent/consumers.py).
+- **Frontend WebRTC**: Offer/answer and PC lifecycle in [frontend/app/hooks/useWebRTC.ts](../frontend/app/hooks/useWebRTC.ts). Uses Google STUN; keeps PC alive even if WS closes.
 
-### Architecture Layers
+## Personas & Providers
+- **Persona System**: Strict schema + DB-backed configs resolved per room in [backend/ai_personas/builder.py](../backend/ai_personas/builder.py). Defaults to `default` persona.
+- **Providers**: Factory in [backend/ai_agent/providers.py](../backend/ai_agent/providers.py) returns STT/LLM/TTS implementations.
+	- STT: MockSTT, SimpleKeywordSTT, Sarvam, Whisper, Groq; select via `STT_PROVIDER`.
+	- LLM: MockLLM, Groq live at [backend/ai_agent/live_providers/groq_llm.py](../backend/ai_agent/live_providers/groq_llm.py).
+	- TTS: Coqui (see [backend/ai_personas/tts_providers.py](../backend/ai_personas/tts_providers.py)); requires FFmpeg + TTS packages.
 
-**Data Flow**: User audio  VAD (20ms frames)  STT  Orchestrator  LLM  TTS (20ms chunks)  AI audio out
+## Audio & VAD Contract
+- Input: 48kHz s16 mono.
+- **VAD Architecture**: Turn-based interaction (2.5s silence threshold, no partial STT)
+- **Single STT call per turn**: Only ONE transcription after complete 2.5s silence
+- **No mid-speech STT**: All partial/streaming calls removed for accuracy
+- STT: Sarvam internally resamples to 16k.
+- TTS streaming: enqueue 20ms frames; always `await queue_audio_output`.
+- Audio conditioning: 8-step pipeline AFTER finalization (DC removal, filters, AGC, etc.)
 
-**Three Conversation Components**:
-1. **ConversationPhase Controller** ([backend/ai_agent/conversation.py](backend/ai_agent/conversation.py)): Single source-of-truth for states (`GREETING  WAIT_FOR_USER  PROCESSING_USER  AI_SPEAKING`). Serializes all transitions with async lock. Rejects input until greeting finishes. Tracks `expected_user_utterance_id` to drop stale VAD buffers from prior turns.
+## Critical Patterns & Gotchas
+- Use **ASGI server**: `daphne` (or gunicorn-asgi). Do not use Django `runserver`.
+- **No multiple offers per room**: Manager reuses existing `RTCPeerConnection`; second offer breaks signaling.
+- **Await `queue_audio_output`**: Ensures VAD mutes during AI speech; prevents echo loop.
+- **Do not bypass `ConversationPhase`**: All transitions must go through the controller.
+- **Update both URLs** on config changes: API base and WS in [frontend/app/hooks/useWebRTC.ts](../frontend/app/hooks/useWebRTC.ts).
 
-2. **AIOrchestrator** ([backend/ai_agent/ai_orchestrator.py](backend/ai_agent/ai_orchestrator.py)): Wraps STT/LLM/TTS providers, maintains per-room history (capped 20 turns), builds prompts, truncates LLM replies at sentence boundaries. Used by `handle_utterance()`.
+## Developer Workflows
+- Tests: `cd backend && python -m pytest` (see [backend/pytest.ini](../backend/pytest.ini)).
+	- Unit: [backend/ai_personas/tests/test_builder.py](../backend/ai_personas/tests/test_builder.py), [backend/ai_agent/tests/test_persona_layer.py](../backend/ai_agent/tests/test_persona_layer.py)
+	- Flow (async): [backend/test_conversation_flow.py](../backend/test_conversation_flow.py)
+- WebRTC debug: verify WS `ws://localhost:8000/ws/signaling/{room_id}/`, check audio tracks in browser DevTools, log VAD energy and phase transitions.
+- Frontend dev: Next.js app under [frontend/app](../frontend/app), components in [frontend/components](../frontend/components).
 
-3. **WebRTCManager** ([backend/ai_agent/webrtc.py](backend/ai_agent/webrtc.py)): One per room, manages RTCPeerConnection, applies incoming VAD, streams TTS audio. Queues TTS as 20ms/1920-byte chunks via `queue_audio_output` (sets `ai_is_speaking` to mute VAD during playback).
+## Where to Extend
+- Add STT/LLM/TTS: implement provider and register in [backend/ai_agent/providers.py](../backend/ai_agent/providers.py).
+- Persona voices/prompts: update via DB or admin UI; code references in [backend/ai_personas](../backend/ai_personas).
+- Room signaling/business logic: [backend/ai_agent/consumers.py](../backend/ai_agent/consumers.py), [backend/ai_agent/webrtc.py](../backend/ai_agent/webrtc.py).
 
-**Signaling**: WebSocket at `/ws/signaling/{room_id}/` ([backend/ai_agent/routing.py](backend/ai_agent/routing.py), [backend/ai_agent/consumers.py](backend/ai_agent/consumers.py)). Serializes offer/answer; manager stays alive until last WS disconnects.
-
-**Frontend WebRTC**: [frontend/app/hooks/useWebRTC.ts](frontend/app/hooks/useWebRTC.ts) fetches room/persona, builds offer, manages PC lifecycle. Keeps PC alive even if WS closes. Uses Google STUN.
-
-### Key Patterns & Implementation Details
-
-**Persona System**: DB-driven configs ([backend/ai_personas/builder.py](backend/ai_personas/builder.py)) with STRICT schema (display_name, system_prompt, flow: `interview|assistant`, voice settings). Resolved per-room via `database_sync_to_async` on offer. Defaults to `default` persona if missing.
-
-**Providers** ([backend/ai_agent/providers.py](backend/ai_agent/providers.py)): Factory pattern (`get_providers()` returns dict of STT/LLM/TTS). 
-- **STT**: MockSTT (returns canned lines, still analyzes energy), SimpleKeywordSTT, Sarvam, Whisper, Groq. Switch via `STT_PROVIDER` env var.
-- **LLM**: MockLLM (echoes), Groq live (see [backend/ai_agent/live_providers/groq_llm.py](backend/ai_agent/live_providers/groq_llm.py))
-- **TTS**: Coqui default (from [backend/ai_personas/tts_providers.py](backend/ai_personas/tts_providers.py)), requires ffmpeg + TTS package
-
-**Question Bank**: Hardcoded in [backend/ai_agent/conversation.py](backend/ai_agent/conversation.py) (general/javascript/python, basic/moderate/advanced). Used by interview flow.
-
-**Audio Contract**: Incoming = 48kHz s16 mono. VAD thresholds: start 500, continue 250, silence 600ms, min utterance 300ms. Sarvam internally resamples to 16k.
-
-### Testing & Validation
-
-**Run tests**: `cd backend && python -m pytest` (config: [backend/pytest.ini](backend/pytest.ini))
-- Unit tests: [backend/ai_personas/tests/test_builder.py](backend/ai_personas/tests/test_builder.py), [backend/ai_agent/tests/test_persona_layer.py](backend/ai_agent/tests/test_persona_layer.py)
-- Flow test: [backend/test_conversation_flow.py](backend/test_conversation_flow.py) (async conversation end-to-end)
-
-**WebRTC Debug**: Verify WS connects to `ws://localhost:8000/ws/signaling/{room_id}/` | Check browser DevTools for audio tracks | Logs show VAD energy and phase transitions.
-
-### Critical Caveats
-- **No multiple offers per room**: Manager reuses existing PC. Creating a second offer breaks signaling.
-- **Await `queue_audio_output`**: If not awaited, VAD doesn't mute during AI speech  echo loop.
-- **Never bypass ConversationPhase controller**: Prevents double speak and stale utterance handling.
-- **Backend config changes**: Update both frontend API base URL AND WebSocket URL in [frontend/app/hooks/useWebRTC.ts](frontend/app/hooks/useWebRTC.ts).
-- **ASGI required**: Must use `daphne` (or gunicorn-asgi), not Django runserver. WebRTC needs proper async.
+Keep changes minimal and respect existing async boundaries and phase control. When unsure, follow usage patterns found in the referenced files and prefer expanding provider factories over inserting one-off integrations.

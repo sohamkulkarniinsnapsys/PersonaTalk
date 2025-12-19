@@ -21,6 +21,8 @@ class AIOrchestrator:
         
         # History storage
         self.call_history = {} 
+        # Structured per-room memory
+        self.memory_by_room: dict[str, dict] = {}
 
     @property
     def providers(self):
@@ -74,9 +76,24 @@ class AIOrchestrator:
         if room_id not in self.call_history:
             self.call_history[room_id] = []
         history = self.call_history[room_id]
+        memory = self.memory_by_room.setdefault(room_id, {
+            'current_topic': None,
+            'last_intent': None,
+            'open_questions': [],
+            'confirmed_facts': [],
+        })
 
         # 3. Build Prompt
+        # Include memory context as an extra system message to ground the LLM
         messages = build_prompt(persona_config, history, transcript)
+        mem_context = []
+        if memory.get('current_topic'):
+            mem_context.append(f"current_topic={memory['current_topic']}")
+        if memory.get('confirmed_facts'):
+            facts = "; ".join(map(str, memory['confirmed_facts'][:5]))
+            mem_context.append(f"facts={facts}")
+        if mem_context:
+            messages.insert(0, {'role': 'system', 'content': f"Conversation memory: {', '.join(mem_context)}"})
 
         # 4. LLM
         llm_start = time.time()
@@ -106,6 +123,16 @@ class AIOrchestrator:
         history.append({"role": "assistant", "content": llm_text})
         if len(history) > 20: 
             self.call_history[room_id] = history[-20:]
+
+        # Simple memory update: set topic if detectable from last turn
+        try:
+            from .intent import resolve_intent
+            intent = resolve_intent(transcript, memory)
+            memory['last_intent'] = intent.get('intent_type')
+            if intent.get('topic'):
+                memory['current_topic'] = intent['topic']
+        except Exception:
+            pass
 
         tts_audio = None
         tts_start = 0
@@ -221,6 +248,16 @@ class AIOrchestrator:
         # Ask LLM to answer user_text in persona tone (text mode, no JSON)
         # System prompt already included in messages
         prompt = build_prompt(persona_config, history, user_text, mode="text")
+        # Inject memory context if available (history may not include it yet)
+        try:
+            # history items are not tied to a specific room here; safe to include generic memory marker
+            # Skip if no memory set in orchestrator for this flow
+            mem_ctx = getattr(self, 'memory_by_room', None)
+            if mem_ctx:
+                # In this text-only method we cannot know room_id; include a neutral instruction
+                prompt.insert(0, {'role': 'system', 'content': 'If the system provides context memory, align answers to current topic and confirmed facts.'})
+        except Exception:
+            pass
         logger.info(f"   Built prompt with {len(prompt)} messages")
         try:
             logger.info(f"   Calling LLM.generate_response...")

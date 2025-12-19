@@ -59,6 +59,12 @@ DEFAULT_TECH = "general"
 class ConversationPhase(str, enum.Enum):
     INIT = "INIT"
     GREETING = "GREETING"
+    LISTENING = "LISTENING"
+    USER_SPEAKING = "USER_SPEAKING"
+    USER_FINISHED = "USER_FINISHED"
+    VALIDATING_UTTERANCE = "VALIDATING_UTTERANCE"
+    CLARIFICATION_REQUIRED = "CLARIFICATION_REQUIRED"
+    THINKING = "THINKING"
     AI_SPEAKING = "AI_SPEAKING"
     WAIT_FOR_USER = "WAIT_FOR_USER"
     PROCESSING_USER = "PROCESSING_USER"
@@ -136,6 +142,20 @@ class ConversationController:
         self.session.vars.setdefault('user_turn_seq', 0)
         self.session.vars.setdefault('utterance_seq', 0)
 
+    async def _notify_state(self, state: ConversationPhase):
+        try:
+            self.session.phase = state
+            if self._notify_callback:
+                await self._notify_callback({
+                    'type': 'agent_state',
+                    'state': state.value,
+                    'roomId': self.session.room_id,
+                    'timestamp': time.time(),
+                })
+        except Exception:
+            # Swallow notify errors; do not impact control flow
+            pass
+
     async def start(self):
         """Begin the conversation lifecycle: move to GREETING and speak first.
         
@@ -154,7 +174,7 @@ class ConversationController:
             # This ensures the first synthesis doesn't block on model load
             await self._wait_for_tts_warmup()
             
-            self.session.phase = ConversationPhase.GREETING
+            await self._notify_state(ConversationPhase.GREETING)
             # Craft a succinct greeting using persona identity
             greeting = self._build_greeting()
             ai_turn_id = self._next_ai_turn_id()
@@ -166,7 +186,7 @@ class ConversationController:
 
             # Synthesize and stream
             try:
-                self.session.phase = ConversationPhase.AI_SPEAKING
+                await self._notify_state(ConversationPhase.AI_SPEAKING)
                 audio = await self.orchestrator.tts.synthesize(greeting, self.session.persona_config.get('voice', {}))
                 await self.send_audio(audio, self.session.last_ai_turn_id)
                 logger.info(f"✅ Greeting sent and played")
@@ -235,6 +255,7 @@ class ConversationController:
             
             if is_low_confidence_msg:
                 logger.info("🔊 Low-confidence STT detected; speaking clarification request to user")
+                await self._notify_state(ConversationPhase.CLARIFICATION_REQUIRED)
                 # Speak the clarification without adding to history
                 try:
                     audio_bytes = await self.orchestrator.tts.synthesize(
@@ -253,8 +274,28 @@ class ConversationController:
                 await self._set_waiting_for_user()
                 return
             
+            # CRITICAL FIX: Low-information utterances MUST trigger clarification, not silent drop
+            # Previously: dropped silently - user thought system was broken
+            # Now: ask for clarification - user knows system is working and listening
             if not self._is_meaningful(text):
-                logger.info("🛑 Ignoring low-information/placeholder utterance; staying in WAIT_FOR_USER")
+                logger.info(f"⏸️ Low-information utterance detected: '{text}'")
+                logger.info(f"   → Will ask user to rephrase or provide more detail")
+                await self._notify_state(ConversationPhase.CLARIFICATION_REQUIRED)
+                
+                # Speak clarification to user
+                try:
+                    clarification_prompt = "I didn't quite get that. Could you give me a bit more detail?"
+                    audio_bytes = await self.orchestrator.tts.synthesize(
+                        clarification_prompt,
+                        self.session.persona_config.get('voice', {})
+                    )
+                    if audio_bytes:
+                        await self.send_audio(audio_bytes, self.session.last_ai_turn_id)
+                        await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.error(f"❌ Failed to synthesize clarification: {e}")
+                
+                # Stay in WAIT_FOR_USER; do NOT advance conversation
                 self.session.active_user_utterance_id = None
                 await self._set_waiting_for_user()
                 return
@@ -269,14 +310,34 @@ class ConversationController:
             flow = self.session.persona_config.get('flow', 'interview')
             logger.info(f"   📋 Flow mode: {flow}")
             
+            # CRITICAL FIX: VALIDATING_UTTERANCE state for incomplete thoughts
+            # If transcript ends with filler/conjunction/incomplete structure, DON'T call LLM yet
+            # Wait for continuation instead
+            await self._notify_state(ConversationPhase.VALIDATING_UTTERANCE)
+            if self._has_incomplete_structure(text):
+                logger.info(f"🔤 Utterance has incomplete structure (ending with filler/conjunction): '{text}'")
+                logger.info(f"   → Waiting for user to continue thought before calling LLM")
+                # Stay in VALIDATING_UTTERANCE; don't advance to PROCESSING_USER
+                # User's next utterance will be merged with this one
+                self.session.active_user_utterance_id = None
+                await self._set_waiting_for_user()  # But keep history updated
+                return
+            
+            if not self._passes_validation(text):
+                await self._notify_state(ConversationPhase.CLARIFICATION_REQUIRED)
+                clarification = "Sorry, I didn't quite get that. Could you rephrase or add a bit more detail?"
+                await self._speak_and_wait(clarification, self.session.persona_config)
+                self.session.active_user_utterance_id = None
+                return
+
             if flow == 'interview':
                 # Deterministic interview flow: question progression + evaluation
-                self.session.phase = ConversationPhase.PROCESSING_USER
+                await self._notify_state(ConversationPhase.PROCESSING_USER)
                 logger.info(f"   🔄 Transitioning to PROCESSING_USER (interview flow) phase")
                 await self._run_interview_flow(text)
             else:
                 # expert/reactive persona: generate an answer and speak
-                self.session.phase = ConversationPhase.PROCESSING_USER
+                await self._notify_state(ConversationPhase.PROCESSING_USER)
                 logger.info(f"   🔄 Transitioning to PROCESSING_USER (question) phase, generating answer")
                 await self._generate_and_speak_answer(text)
 
@@ -310,7 +371,7 @@ class ConversationController:
             await self._notify_chat('assistant', question, turn_id=ai_turn_id)
             
             logger.info(f"   🔊 Synthesizing question to speech...")
-            self.session.phase = ConversationPhase.AI_SPEAKING
+            await self._notify_state(ConversationPhase.AI_SPEAKING)
             audio = await self.orchestrator.tts.synthesize(question, persona_cfg.get('voice', {}))
             logger.info(f"   ✅ TTS complete ({len(audio)} bytes), sending audio...")
             
@@ -326,7 +387,7 @@ class ConversationController:
             # Fallback: send a generic response
             try:
                 fallback = "I'm listening. Please tell me more."
-                self.session.phase = ConversationPhase.AI_SPEAKING
+                await self._notify_state(ConversationPhase.AI_SPEAKING)
                 audio = await self.orchestrator.tts.synthesize(fallback, persona_cfg.get('voice', {}))
                 await self.send_audio(audio, self.session.last_ai_turn_id)
             except Exception as e2:
@@ -381,16 +442,21 @@ class ConversationController:
             self.session.last_ai_turn_id = ai_turn_id
             self.session.add_ai_turn(answer, ai_turn_id)
             await self._notify_chat('assistant', answer, turn_id=ai_turn_id)
-            logger.info(f"   🔊 Synthesizing TTS for answer...")
-            self.session.phase = ConversationPhase.AI_SPEAKING
+            # FIXED: Synthesize FULL answer as ONE continuous audio (not sentence-by-sentence)
+            # Previous behavior: split into sentences, synthesize each, stream with pauses
+            # Problem: Unnatural pauses between sentences ("Got it." [pause] "Could you tell me...")
+            # Solution: Feed entire answer to TTS, let Coqui handle pacing naturally
+            logger.info(f"   🔊 Synthesizing complete answer as single audio stream...")
+            await self._notify_state(ConversationPhase.AI_SPEAKING)
             audio = await self.orchestrator.tts.synthesize(answer, persona_cfg.get('voice', {}))
-            logger.info(f"   ✅ TTS complete, sending audio ({len(audio)} bytes)...")
+            logger.info(f"   ✅ Synthesized {len(audio)} bytes, streaming to client...")
             await self.send_audio(audio, self.session.last_ai_turn_id)
-            logger.info(f"   ✅ Audio sent, returning to WAIT_FOR_USER")
+            logger.info(f"   ✅ Audio playback complete, returning to WAIT_FOR_USER")
             await self._set_waiting_for_user()
         except Exception as e:
             logger.error(f"❌ Error in _generate_and_speak_answer: {e}", exc_info=True)
             await self._set_waiting_for_user()
+            
 
     # -------------------- Interview Flow Helpers --------------------
 
@@ -604,7 +670,7 @@ class ConversationController:
             # Notify UI before audio for responsiveness
             await self._notify_chat('assistant', response, turn_id=self.session.last_ai_turn_id)
             logger.info("   🔊 Synthesizing interview question/feedback...")
-            self.session.phase = ConversationPhase.AI_SPEAKING
+            await self._notify_state(ConversationPhase.AI_SPEAKING)
             audio = await self.orchestrator.tts.synthesize(response, persona_cfg.get('voice', {}))
             await self.send_audio(audio, self.session.last_ai_turn_id)
             await self._set_waiting_for_user()
@@ -618,7 +684,7 @@ class ConversationController:
         self.session.last_ai_turn_id = ai_turn_id
         self.session.add_ai_turn(text, ai_turn_id)
         await self._notify_chat('assistant', text, turn_id=ai_turn_id)
-        self.session.phase = ConversationPhase.AI_SPEAKING
+        await self._notify_state(ConversationPhase.AI_SPEAKING)
         audio = await self.orchestrator.tts.synthesize(text, persona_cfg.get('voice', {}))
         await self.send_audio(audio, self.session.last_ai_turn_id)
         await self._set_waiting_for_user()
@@ -637,7 +703,7 @@ class ConversationController:
 
     async def _set_waiting_for_user(self):
         """Reset to WAIT_FOR_USER, clear active flags, and prime the next expected utterance."""
-        self.session.phase = ConversationPhase.WAIT_FOR_USER
+        await self._notify_state(ConversationPhase.WAIT_FOR_USER)
         self.session.active_user_utterance_id = None
         self.session.expected_user_utterance_id = self._new_utterance_id()
         logger.info(f"🎧 Waiting for user; expecting utterance_id={self.session.expected_user_utterance_id}")
@@ -714,3 +780,90 @@ class ConversationController:
             await self._notify_callback(message)
         except Exception as e:
             logger.debug(f"notify_chat failed: {e}")
+
+    def _passes_validation(self, text: str) -> bool:
+        """Semantic validation before invoking LLM: length, tokens, obvious fillers."""
+        if not text:
+            return False
+        s = text.strip()
+        if len(s.split()) < 3:
+            return False
+        low_conf_markers = [
+            "i didn't catch that",
+            "could you please repeat",
+            "please repeat",
+            "too quiet",
+        ]
+        if any(m in s.lower() for m in low_conf_markers):
+            return False
+        return True
+    
+    def _has_incomplete_structure(self, text: str) -> bool:
+        """CRITICAL FIX: Detect incomplete utterances that should wait for continuation.
+        
+        Returns True if transcript appears incomplete (ends with filler, conjunction, etc.)
+        so we DON'T call LLM yet and instead wait for user to finish thought.
+        
+        Examples that return True:
+        - "I remember a difference between" (trailing conjunction)
+        - "Then maybe if we ask what is" (trailing preposition + incomplete clause)
+        - "So like, um..." (trailing filler)
+        
+        This prevents: "I remember a difference between" → LLM call → "Got it, which two things..."
+        Instead we now: collect "I remember a difference between" → wait for continuation → 
+        user says "useEffect and useLayoutEffect" → merge & call LLM with complete thought.
+        """
+        if not text or len(text) < 3:
+            return False
+        
+        s = text.strip().lower()
+        
+        # Incomplete grammatical structures (should be followed by more speech)
+        incomplete_endings = [
+            "between",  # "difference between" (waiting for the two things)
+            "and",      # "X and" (waiting for what comes after)
+            "or",       # "X or" (waiting for alternatives)
+            "but",      # "X but" (waiting for contrast)
+            "like",     # "like" (waiting for example/list)
+            "so",       # "so..." (waiting for explanation)
+            "because",  # "because" (waiting for reason)
+            "if",       # "if..." (waiting for consequence)
+            "when",     # "when..." (waiting for result)
+            "where",    # "where..." (waiting for location/clarification)
+            "which",    # "which..." (waiting for specification)
+            "that",     # "that" (waiting for completion)
+            "is",       # "is..." (waiting for predicate continuation)
+            "on",       # "on..." (waiting for object)
+            "with",     # "with..." (waiting for what's involved)
+            "to",       # "to..." (waiting for verb/object)
+            "for",      # "for..." (waiting for purpose/recipient)
+        ]
+        
+        # Check if ends with incomplete conjunction/preposition
+        for ending in incomplete_endings:
+            if s.endswith(ending):
+                logger.debug(f"   📍 Incomplete structure detected: ends with '{ending}'")
+                return True
+        
+        # Check for trailing fillers/hesitations
+        filler_endings = [
+            "um",
+            "uh",
+            "like",
+            "you know",
+            "i mean",
+            "sort of",
+            "kind of",
+            "maybe",
+        ]
+        for filler in filler_endings:
+            if s.endswith(filler):
+                logger.debug(f"   🤔 Trailing filler detected: '{filler}'")
+                return True
+        
+        # Check if ends mid-list (comma at end suggests more items coming)
+        if s.endswith(","):
+            logger.debug(f"   📋 Ends with comma: appears to be mid-list")
+            return True
+        
+        return False

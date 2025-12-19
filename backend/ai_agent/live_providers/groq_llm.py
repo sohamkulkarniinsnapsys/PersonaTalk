@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import time
+import asyncio
 from typing import List, Dict, Any
 
 import requests
@@ -57,8 +58,9 @@ class GroqLLM:
             pieces.append(f"{role}: {m.get('content','')}\n")
         return "\n".join(pieces)
 
-    def _post(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
+    async def _post(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
         # Try several common Groq endpoint shapes to be tolerant of API variations.
+        # Now async: wraps all requests.post calls in asyncio.to_thread to avoid event loop blocking.
         candidate_paths = [
             # Prefer the OpenAI-compatible endpoint Groq documents
             "/openai/v1/chat/completions",
@@ -94,7 +96,12 @@ class GroqLLM:
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                 }
-                r = self.session.post(self.model_endpoint, json=payload, timeout=30)
+                r = await asyncio.to_thread(
+                    self.session.post,
+                    self.model_endpoint,
+                    json=payload,
+                    timeout=30,
+                )
                 if r.status_code == 200:
                     try:
                         data = r.json()
@@ -175,7 +182,13 @@ class GroqLLM:
                                     payload_to_send['stop'] = None
 
                             logger.debug(f"Groq trying {url} max_tokens={max_tokens} payload keys: {list(payload_to_send.keys())} (attempt {attempt+1})")
-                            r = self.session.post(url, json=payload_to_send, timeout=30)
+                            # Run blocking network call in worker thread to avoid blocking event loop
+                            r = await asyncio.to_thread(
+                                self.session.post,
+                                url,
+                                json=payload_to_send,
+                                timeout=30,
+                            )
                             if r.status_code == 200:
                                 try:
                                     data = r.json()
@@ -201,7 +214,7 @@ class GroqLLM:
                             if self._full_failure_logs < self._max_full_failure_logs:
                                 logger.exception(f"Exception contacting Groq at {url}")
                                 self._full_failure_logs += 1
-                        time.sleep(0.2)
+                        await asyncio.sleep(0.2)
 
         # If we get here, none of the endpoint/payload combos worked
         raise RuntimeError(f"Groq API failed after trying endpoints; last error: {last_err}")
@@ -270,7 +283,7 @@ class GroqLLM:
             # Use HIGHER max_tokens (4096) to ensure full responses aren't truncated mid-sentence
             # Groq models support up to 4096 tokens and we need enough budget for detailed explanations
             logger.info(f"🧠 GroqLLM: Calling _post with max_tokens=4096 (for complete answers)")
-            text = self._post(prompt, max_tokens=4096, temperature=float(os.environ.get('GROQ_TEMP', 0.2)))
+            text = await self._post(prompt, max_tokens=4096, temperature=float(os.environ.get('GROQ_TEMP', 0.2)))
             logger.info(f"🧠 GroqLLM: Received response ({len(text)} chars): '{text[:150]}'...")
             # Groq output may already be a JSON string if evaluation prompt asked for JSON.
             # We return raw string or parsed JSON to the orchestrator which handles it.

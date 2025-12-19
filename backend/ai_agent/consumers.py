@@ -134,6 +134,11 @@ class CallConsumer(AsyncWebsocketConsumer):
             elif msg_type == 'ice-candidate':
                 if self.room_id in self._managers:
                     await self._managers[self.room_id].handle_candidate(data)
+            elif msg_type == 'cancel_tts':
+                # Client requests to stop current AI speech (barge-in)
+                manager = self._managers.get(self.room_id)
+                if manager:
+                    await manager.cancel_tts()
                 
         except json.JSONDecodeError:
             logger.error("Invalid JSON received")

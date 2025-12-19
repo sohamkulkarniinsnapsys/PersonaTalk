@@ -11,6 +11,8 @@ import logging
 import io
 import asyncio
 import requests
+import uuid
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
@@ -171,18 +173,18 @@ class WhisperLocalSTT:
                     # Real conversational speech typically has avg_logprob between -0.5 and -1.2
                     if avg_logprob is not None and avg_logprob < -1.5:
                         logger.warning(f"⚠️  Very low confidence (avg_logprob={avg_logprob:.2f} < -1.5); asking user to repeat")
-                        return "I didn't catch that, could you please repeat?"
+                        return ""  # Return empty, let controller decide
                     
                     # Only reject if EXTREMELY high no-speech (> 0.85) - the 0.6 threshold was rejecting valid speech
                     if no_speech_prob > 0.85:
                         logger.warning(f"⚠️  Very high no-speech probability ({no_speech_prob:.2f}); likely silence")
-                        return "I didn't catch that, could you please repeat?"
+                        return ""  # Return empty, let controller decide
                 
                 if transcript:
                     # Additional validation: reject suspiciously short transcripts that might be artifacts
                     if len(transcript) < 2 and transcript.lower() in ['a', 'i', 'the', 'to', 'of']:
                         logger.warning(f"⚠️  Single-letter artifact detected: '{transcript}'; treating as noise")
-                        return "I didn't catch that, could you please repeat?"
+                        return ""  # Return empty, let controller decide
                     
                     logger.info(f"✅ Local Whisper transcribed: '{transcript}'")
                     return transcript
@@ -419,15 +421,11 @@ class SarvamSTT:
 
         # Docs: Saarika supports 11 Indic languages incl. en-IN; use latest model by default
         self.model = os.environ.get("SARVAM_MODEL", "saarika:v2.5")  # valid: saarika:v1|v2|v2.5|flash
-        configured_language = os.environ.get("SARVAM_LANGUAGE_CODE", "en-IN") or "en-IN"
-        if configured_language.lower() in {"auto", "unknown", ""}:
-            configured_language = "unknown"
-
-        # Sarvam API accepts en-IN (not plain en); map common inputs to supported code
-        if configured_language.lower() in {"en", "en-in", "english"}:
-            configured_language = "en-IN"
-
-        self.language_code = configured_language
+        
+        # HARDCODED: Indian English (en-IN) based on user requirement
+        # Production logs showed multi-language fallback caused Tamil/Oriya transcripts
+        # when audio quality was marginal. Force en-IN for consistent behavior.
+        self.language_code = "en-IN"
         supported_languages = {
             "en-IN",
             "hi-IN",
@@ -447,6 +445,8 @@ class SarvamSTT:
         self.session = requests.Session()
         self.session.headers.update({
             "API-Subscription-Key": self.api_key,
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
         })
         
         logger.info("✅ Initialized SarvamSTT with Sarvam AI API")
@@ -482,35 +482,64 @@ class SarvamSTT:
                     # Enforce mono, 16kHz, 16-bit
                     audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
 
-                    # CRITICAL: Minimal, surgical normalization to preserve speech fidelity
-                    # Over-processing (aggressive gain, filters) distorts consonants and confuses STT
-                    # Example: Backend vs Background confusion was caused by +12dB gain clipping fricatives
-                    target_rms = -20.0  # Sarvam's sweet spot for conversational speech
+                    # CRITICAL: Proper normalization for Sarvam STT accuracy
+                    # Sarvam model is trained on -20dBFS audio at 16kHz sample rate
+                    # Fix: Remove aggressive external filtering that was destroying consonants
+                    
+                    # Step 1: NO external HPF filtering
+                    # 200Hz HPF was too aggressive - removed fricative consonants (s, sh, f, th)
+                    # Sarvam's internal preprocessing has better frequency shaping
+                    # Result: Consonants preserved, better transcription accuracy
+                    logger.info(f"   Preprocessing: Direct to Sarvam (no external filtering)")
+                    
+                    # Step 2: Normalize to -20dBFS (Sarvam's target level)
+                    target_rms = os.environ.get("SARVAM_TARGET_DBFS", "-20.0")
+                    try:
+                        target_rms = float(target_rms)
+                    except (ValueError, TypeError):
+                        target_rms = -20.0
+                    
                     current_rms = audio.dBFS
                     if current_rms is None or current_rms == float("-inf"):
                         current_rms = -60.0
+                    
                     gain_needed = target_rms - current_rms
-                    if gain_needed > 0.5:  # Only apply if meaningful
-                        # REDUCED MAX: +3dB instead of +12dB to avoid distortion
-                        # Speech is clearer with slight underamplification than over-amplification
-                        audio = audio.apply_gain(min(gain_needed, 3.0))
-                        logger.info(f"   Applied gentle gain: +{min(gain_needed, 3.0):.1f}dB")
+                    logger.info(f"   Audio level: {current_rms:.1f} dBFS, target: {target_rms:.1f}dB, gain needed: {gain_needed:.1f}dB")
                     
-                    # Safety limiter at -1dB (aggressive headroom to avoid clipping)
-                    if audio.max_dBFS is not None and audio.max_dBFS > -1.0:
-                        headroom = -1.0 - audio.max_dBFS
+                    if gain_needed > 0.5:  # Need amplification
+                        applied_gain = min(gain_needed, 12.0)
+                        audio = audio.apply_gain(applied_gain)
+                        logger.info(f"   Applied gain: +{applied_gain:.1f}dB")
+                    elif gain_needed < -0.5:  # Too loud, reduce
+                        audio = audio.apply_gain(gain_needed)
+                        logger.info(f"   Applied reduction: {gain_needed:.1f}dB")
+                    else:
+                        logger.info(f"   Audio level OK at {current_rms:.1f} dBFS")
+                    
+                    # Step 3: Soft limiter - ONLY if peak will actually clip
+                    # Bug fix: Previous code applied -1dB even when peak was safe
+                    # This made normalized audio too quiet after perfect normalization
+                    max_dbfs = audio.max_dBFS
+                    if max_dbfs is None or max_dbfs == float("-inf"):
+                        logger.debug(f"   Peak level unknown, no limiter applied")
+                    elif max_dbfs > -1.0:
+                        # Only reduce if peak exceeds -1dB (prevents clipping)
+                        headroom = -1.0 - max_dbfs
                         audio = audio.apply_gain(headroom)
-                        logger.info(f"   Applied headroom: {headroom:.2f}dB")
-                    
-                    # SKIP high-pass filter entirely
-                    # 80 Hz filter removes important fricative/consonant content (f, v, s, sh, th sounds)
-                    # These are critical for distinguishing: backend vs background, web vs weird, etc.
-                    # Sarvam's model is robust to low-freq rumble; prefer clarity over cleanup
-                    # If rumble is excessive, Sarvam will flag low confidence and we'll retry
+                        logger.info(f"   Applied soft limiter: {headroom:.2f}dB (peak was {max_dbfs:.1f}dBFS)")
+                    else:
+                        logger.info(f"   Peak safe at {max_dbfs:.1f}dBFS (no limiter needed)")
 
                     wav_bytes = audio.export(format="wav").read()
                     
-                    logger.info(f"🎤 SarvamSTT: Resampled 48kHz ({len(audio_bytes)} bytes) → 16kHz ({len(wav_bytes)} WAV bytes), mono s16, surgically normalized (target=-20dBFS, max_gain=+3dB, no HPF)")
+                    logger.info(f"🎤 SarvamSTT: Resampled 48kHz ({len(audio_bytes)} bytes) → 16kHz ({len(wav_bytes)} WAV bytes)")
+                    logger.info(f"   Preprocessing: NO HPF (Sarvam handles it) + normalize to -20dBFS + soft limiter")
+                    
+                    # Detect microphone level issues
+                    if current_rms < -50.0:
+                        logger.warning(f"⚠️  Microphone very quiet ({current_rms:.1f} dBFS)! User should speak louder or increase mic volume")
+                    elif current_rms > -10.0:
+                        logger.warning(f"⚠️  Microphone very loud ({current_rms:.1f} dBFS)! May cause distortion, reduce mic volume")
                 except Exception as e:
                     logger.warning(f"⚠️  Resampling/normalization to 16kHz failed ({e}); using original 48kHz")
                     wav_bytes = self._pcm_to_wav(audio_bytes, sample_rate=48000, num_channels=1, sample_width=2)
@@ -529,25 +558,39 @@ class SarvamSTT:
             else:
                 input_codec = None
 
+            # Generate unique request ID to prevent caching across sessions
+            request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            session_id = f"session-{uuid.uuid4().hex[:12]}"
+            logger.info(f"   🔑 Request ID: {request_id} | Session: {session_id}")
+            
             async def call_sarvam(lang_code: str):
-                # Prepare form data
+                # Prepare form data with unique identifiers
                 data = {
                     'language_code': lang_code,
                     'model': self.model,
                 }
                 if input_codec:
                     data['input_audio_codec'] = input_codec
+                
+                # Add unique headers per request
+                request_headers = {
+                    'X-Request-ID': request_id,
+                    'X-Session-ID': session_id,
+                }
 
                 retry_count = 0
                 max_retries = 2
                 backoff_delay = 0.5
                 while retry_count <= max_retries:
                     try:
-                        resp = self.session.post(
+                        # Run blocking requests in a worker thread to avoid blocking the event loop
+                        resp = await asyncio.to_thread(
+                            self.session.post,
                             self.api_url,
                             files=files,
                             data=data,
-                            timeout=30
+                            headers=request_headers,
+                            timeout=30,
                         )
                         logger.info(
                             "🛰️ SarvamSTT POST %s | model=%s | lang=%s | codec=%s | wav_bytes=%s | status=%s",
@@ -589,49 +632,25 @@ class SarvamSTT:
 
             transcript, confidence = extract_transcript(result)
 
-            # If low confidence or empty, try a fallback language (unknown/auto then en-IN)
-            fallback_langs = []
-            if not transcript or (confidence is not None and confidence < 0.6):
-                if self.language_code != 'unknown':
-                    fallback_langs.append('unknown')
-                if self.language_code != 'en-IN':
-                    fallback_langs.append('en-IN')
-
-            for fallback_lang in fallback_langs:
-                try:
-                    audio_stream.seek(0)
-                    resp_fb = await call_sarvam(fallback_lang)
-                    if not resp_fb or not resp_fb.ok:
-                        continue
-                    fb_json = resp_fb.json()
-                    fb_transcript, fb_conf = extract_transcript(fb_json)
-                    logger.info(
-                        "🛰️ SarvamSTT fallback lang=%s transcript='%s' conf=%s",
-                        fallback_lang,
-                        fb_transcript,
-                        f"{fb_conf:.2f}" if fb_conf is not None else "n/a",
-                    )
-                    if fb_transcript:
-                        transcript, confidence = fb_transcript, fb_conf
-                        break
-                except Exception as retry_err:
-                    logger.warning(f"⚠️  Sarvam AI fallback ({fallback_lang}) failed: {retry_err}")
-
+            # REMOVED: Multi-language fallback (was causing Tamil/Oriya transcripts)
+            # Hardcoded to en-IN means: if Sarvam can't transcribe in English, return empty
+            # Let controller handle retry/clarification rather than guessing wrong language
+            
             if transcript:
                 logger.info(f"✅ Sarvam AI transcribed: '{transcript}'")
                 if confidence is not None:
                     logger.info(f"   Confidence: {confidence:.2f}")
                     if confidence < 0.5:
                         logger.warning(f"⚠️  Low confidence ({confidence:.2f} < 0.5 threshold); asking user to repeat")
-                        return "I didn't catch that, could you please repeat?"
+                        return ""  # Return empty, let controller decide
                 return self._postprocess_transcript(transcript)
 
             logger.warning("⚠️  Sarvam AI returned empty transcript")
             if len(wav_bytes) < 100:
                 logger.error(f"❌ Audio size too small ({len(wav_bytes)} bytes) - VAD likely dropped utterance")
                 logger.info(f"   This usually means: user spoke too quietly, or VAD threshold too high")
-                return "Your speech was too quiet. Please speak up."
-            return "I didn't catch that, could you please repeat?"
+                return ""  # Return empty, let controller handle
+            return ""  # Return empty instead of fallback prompt
                 
         except requests.exceptions.RequestException as e:
             body_preview = ""

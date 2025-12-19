@@ -5,6 +5,7 @@ daphne
 aiortc
 av
 numpy
+scipy
 asgiref
 wcwidth
 django-cors-headers

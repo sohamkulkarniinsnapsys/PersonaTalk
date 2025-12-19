@@ -20,6 +20,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
     const [isVideoOff, setIsVideoOff] = useState(false);
     const [persona, setPersona] = useState<PersonaInfo | null>(null);
     const [aiSpeaking, setAiSpeaking] = useState(false);
+    const [agentState, setAgentState] = useState<'INIT' | 'GREETING' | 'LISTENING' | 'USER_SPEAKING' | 'USER_FINISHED' | 'VALIDATING_UTTERANCE' | 'CLARIFICATION_REQUIRED' | 'THINKING' | 'AI_SPEAKING' | 'WAIT_FOR_USER' | 'PROCESSING_USER' | 'QUESTION' | 'EVALUATION' | 'RETRY' | 'EXPLANATION' | 'SUMMARY' | 'END' | undefined>(undefined);
     // Tracks which AI turns have started audio playback (signaled by backend)
     const [aiPlaybackStartedTurns, setAiPlaybackStartedTurns] = useState<Set<string>>(new Set());
     // Global dedupe for transcript messages
@@ -247,7 +248,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                         timestamp: typeof data.timestamp === 'number' ? data.timestamp : Date.now() / 1000,
                         utteranceId: data.utteranceId as string | undefined,
                         turnId: data.turnId as string | undefined,
-                        isStreaming: true, // Mark as streaming (animation will occur in UI)
+                        isStreaming: Boolean(data.isPartial) || true, // Partial transcripts stream; final also stream briefly
                     };
                     
                     console.log(`📝 Transcript received: role="${role}", turnId="${item.turnId}", text="${item.text.substring(0, 50)}..."`);
@@ -298,6 +299,11 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                             return added;
                         }
                     });
+                } else if (data.type === 'agent_state') {
+                    const s = String(data.state || '').toUpperCase();
+                    console.log('🤖 Agent state:', s);
+                    // @ts-ignore - we trust backend states
+                    setAgentState(s);
                 }
             } catch (err) {
                 console.error('Error handling WS message:', err);
@@ -494,6 +500,12 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
         }
     }, [isVideoOff]);
 
+    const cancelTTS = useCallback(() => {
+        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+            ws.current.send(JSON.stringify({ type: 'cancel_tts' }));
+        }
+    }, []);
+
     return {
         localStream,
         remoteStream,
@@ -508,6 +520,8 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
         aiSpeaking,
         setAiSpeaking,
         transcript,
-        aiPlaybackStartedTurns
+        aiPlaybackStartedTurns,
+        agentState,
+        cancelTTS
     };
 };

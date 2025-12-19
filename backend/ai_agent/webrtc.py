@@ -12,6 +12,9 @@ from aioice import stun
 from aioice.stun import TransactionTimeout
 from .ai_orchestrator import AIOrchestrator
 from .conversation import ConversationPhase
+from .audio_conditioning import AudioConditioner
+from typing import Deque
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +144,15 @@ class WebRTCManager:
         self._last_consumed_utterance_id = None
         # Flag to track when manager is closing (prevents ice-candidate processing race)
         self._closing = False
+        # TTS cancellation support
+        self._tts_cancel_event = asyncio.Event()
+        self._tts_playback_task: asyncio.Task | None = None
+        # Audio conditioning pipeline
+        self.audio_conditioner = AudioConditioner(sample_rate=48000)
+        # Rolling overlapping buffers for transcript stability
+        self.rolling_transcripts: Deque[str] = deque(maxlen=3)  # Keep last 3 transcripts
+        # Guard window after AI playback starts (barge-in ignored during this window)
+        self._ai_playback_guard_deadline: float = 0.0
 
     async def handle_offer(self, sdp, type_):
         # CRITICAL: Only handle the FIRST offer per manager
@@ -265,64 +277,68 @@ class WebRTCManager:
     async def process_incoming_audio(self, track):
         """
         Reads audio frames, runs VAD, buffers utterance, calls ConversationController or Orchestrator.
+        
+        The new pipeline enforces strict turn-taking with explicit gating during AI speech,
+        conservative barge-in, and a single STT call per finalized user utterance.
         """
         logger.info(f"Starting audio processing for room {self.room_id}")
-        
-        # Wait for controller to be initialized before processing
+
+        capture_sample_rate: int | None = None
+        try:
+            resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=48000)
+        except Exception as e:
+            logger.error(f"Failed to init AudioResampler: {e}")
+            resampler = None
+
         max_wait = 50
         for _ in range(max_wait):
             if self.controller is not None:
                 logger.info(f"ConversationController is ready; starting audio processing for room {self.room_id}")
                 break
             await asyncio.sleep(0.1)
-        
+
         if self.controller is None:
             logger.warning(f"Audio processing started but no controller initialized for room {self.room_id}; will use fallback orchestrator mode")
-        
+
+        FRAME_DURATION = 0.02
+        BASE_START = int(os.environ.get("VAD_START_THRESHOLD", "500"))
+        BASE_CONTINUE = int(os.environ.get("VAD_CONTINUE_THRESHOLD", "250"))
+        SILENCE_DURATION_MS = 2500
+        SILENCE_FRAME_COUNT = int(SILENCE_DURATION_MS / (FRAME_DURATION * 1000))
+        MIN_BUFFER_MS = 1500
+        MIN_BUFFER_BYTES = int(MIN_BUFFER_MS * 48000 * 2 / 1000)
+        MAX_UTTERANCE_MS = int(os.environ.get("VAD_MAX_UTTERANCE_MS", "30000"))
+        MAX_UTTERANCE_BYTES = int(MAX_UTTERANCE_MS * 48000 * 2 / 1000)
+
+        START_SNR_DB = float(os.environ.get("VAD_START_SNR_DB", "10"))
+        MIN_CONSECUTIVE_START = int(os.environ.get("VAD_MIN_CONSECUTIVE_START", "6"))
+        POST_AI_GRACE_MS = int(os.environ.get("VAD_POST_AI_GRACE_MS", "1200"))
+        POST_AI_GRACE_FRAMES = int(POST_AI_GRACE_MS / (FRAME_DURATION * 1000))
+
+        BARGE_PEAK_MIN = int(os.environ.get("VAD_BARGE_PEAK_MIN", "1800"))
+        BARGE_MIN_FRAMES = int(os.environ.get("VAD_BARGE_MIN_FRAMES", "10"))
+        BARGE_SNR_DB = float(os.environ.get("VAD_BARGE_SNR_DB", "12"))
+
+        STT_MIN_DURATION_MS = 400
+        STT_MIN_RMS = 0.003
+        STT_MIN_SNR_DB = 3.0
+
         buffer = bytearray()
         silence_frames = 0
         speaking = False
         frame_count = 0
-        voiced_frames = 0
-        total_frames_in_utt = 0
-        recent_energy_window = []
-        
-        # CRITICAL: Post-AI-speech grace period to avoid echo/noise false triggers
-        # When AI finishes speaking, ignore all audio for N frames to let echo/noise settle
-        # This prevents catching tail-end of AI audio or user ambient noise as a new utterance
-        post_ai_grace_frames = 0  # Countdown timer
-        POST_AI_GRACE_MS = int(os.environ.get("VAD_POST_AI_GRACE_MS", "800"))  # 800ms grace period
-        POST_AI_GRACE_FRAMES = int(POST_AI_GRACE_MS / (0.02 * 1000))  # Convert to frame count
-        
-        # Consecutive voiced frame counter for start detection
-        # Require N consecutive frames above threshold before accepting speech start
-        # This prevents single-frame noise spikes from triggering false utterances
-        consecutive_voiced = 0
-        MIN_CONSECUTIVE_VOICED = int(os.environ.get("VAD_MIN_CONSECUTIVE_VOICED", "3"))  # 60ms continuous speech
-        
-        # Track previous ai_is_speaking state to detect transitions
+        consecutive_start_frames = 0
+        consecutive_barge_frames = 0
+        post_ai_grace_frames = 0
+        speech_start_time = None
+        utterance_in_flight = False
+        current_utterance_id = None
         prev_ai_speaking = False
-        
-        # VAD Parameters (tuned for Sarvam AI 16kHz optimization with adaptive thresholds)
-        # Two-tier system: high threshold for start detection, lower for continuation
-        # This prevents mid-sentence cutoff when user pauses or speaks quieter words
-        FRAME_DURATION = 0.02 # 20ms
-        START_THRESHOLD = int(os.environ.get("VAD_START_THRESHOLD", "500"))  # Start of speech
-        CONTINUE_THRESHOLD = int(os.environ.get("VAD_CONTINUE_THRESHOLD", "250"))  # Mid-sentence continuation
-        # INCREASED: 800ms to allow natural user pauses without cutoff (from 600ms)
-        # User may pause mid-thought; we want complete sentences not fragments
-        SILENCE_DURATION_MS = int(os.environ.get("VAD_SILENCE_DURATION_MS", "800"))
-        SILENCE_FRAME_COUNT = int(SILENCE_DURATION_MS / (FRAME_DURATION * 1000))
-        ENERGY_WINDOW_SIZE = 10  # Track recent 200ms of energy
-        
-        # Additional gating to avoid calling STT on noise/very short utterances
-        # TUNED: Lowered thresholds to capture normal speech ("JavaScript", "yes", etc.)
-        # Users speak naturally with pauses/unvoiced consonants, not all frames are voiced
-        MIN_UTTER_MS = int(os.environ.get("VAD_MIN_UTTER_MS", "300"))  # 300ms allows short responses
-        MIN_VOICED_FRAMES = int(os.environ.get("VAD_MIN_VOICED_FRAMES", "4"))  # 4 frames = 80ms min spoken sound
-        MIN_VOICED_RATIO = float(os.environ.get("VAD_MIN_VOICED_RATIO", "0.08"))  # 8% voiced (natural speech has pauses)
-        
-        logger.info(f"VAD settings: start={START_THRESHOLD}, continue={CONTINUE_THRESHOLD}, silence={SILENCE_DURATION_MS}ms (REDUCED for <30s audio limit)")
+
+        logger.info(
+            f"VAD settings: start>={BASE_START}, continue>={BASE_CONTINUE}, silence={SILENCE_DURATION_MS}ms, "
+            f"min_buffer={MIN_BUFFER_MS}ms, barge_min_peak={BARGE_PEAK_MIN}, barge_frames={BARGE_MIN_FRAMES}"
+        )
 
         try:
             while self.running:
@@ -332,207 +348,392 @@ class WebRTCManager:
                 except Exception as e:
                     logger.info(f"Audio track ended: {e}")
                     break
-                
-                # Convert to numpy for energy calculation
-                # frame.to_ndarray() returns shape (channels, samples), e.g. (1, 960)
-                arr = frame.to_ndarray()
+
+                try:
+                    if resampler:
+                        resampled_frames = resampler.resample(frame)
+                        if isinstance(resampled_frames, list):
+                            if len(resampled_frames) == 0:
+                                continue
+                            resampled_frame = resampled_frames[0]
+                        else:
+                            resampled_frame = resampled_frames
+                        arr = resampled_frame.to_ndarray()
+                        capture_sample_rate = 48000
+                    else:
+                        arr = frame.to_ndarray()
+                        capture_sample_rate = getattr(frame, "sample_rate", 48000) or 48000
+                except Exception as e:
+                    logger.warning(f"Frame resample failed; using raw frame: {e}")
+                    arr = frame.to_ndarray()
+                    capture_sample_rate = getattr(frame, "sample_rate", 48000) or 48000
+
                 if arr.ndim > 1:
                     arr = arr[0]
                 arr = arr.astype(np.int16, copy=False)
-                energy = np.max(np.abs(arr))
-                
-                # Log energy every 50 frames (~1 second) for debugging
-                if frame_count % 50 == 0:
-                    logger.info(f"Audio frame {frame_count}: energy={energy}, speaking={speaking}, buffer_size={len(buffer)}")
-                
-                # Raw bytes for buffer (s16le mono 48kHz)
+
+                energy_peak = int(np.max(np.abs(arr)))
+                energy_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                 raw_bytes = arr.tobytes()
-                
-                # CRITICAL: Skip VAD processing if AI is currently speaking (prevents echo/feedback)
-                # This must be checked BEFORE any speech detection logic
-                if self.ai_is_speaking:
-                    logger.debug(f"VAD skipped (AI speaking) - energy={energy}")
-                    # Reset all VAD state when AI is speaking to ensure clean slate
-                    speaking = False
-                    buffer = bytearray()
-                    silence_frames = 0
-                    consecutive_voiced = 0
-                    voiced_frames = 0
-                    total_frames_in_utt = 0
-                    prev_ai_speaking = True
-                    continue
-                
-                # CRITICAL: Detect AI->User transition and start grace period
-                # When ai_is_speaking changes from True->False, start countdown to ignore echo/noise
+
+                samples_float = arr.astype(np.float32) / 32767.0
+                # Only learn noise when AI is not speaking to avoid bias from playback
+                self.audio_conditioner.noise_estimator.update(samples_float, is_speech=self.ai_is_speaking or speaking)
+                noise_floor = self.audio_conditioner.noise_estimator.get_noise_floor()
+                snr_db = 20 * np.log10(max(energy_rms, 1e-6) / max(noise_floor, 1e-6))
+
+                if frame_count % 50 == 0:
+                    logger.info(
+                        f"Audio frame {frame_count}: peak={energy_peak}, rms={energy_rms:.4f}, snr={snr_db:.1f} dB, "
+                        f"speaking={speaking}, buffer_size={len(buffer)}"
+                    )
+
                 if prev_ai_speaking and not self.ai_is_speaking:
                     post_ai_grace_frames = POST_AI_GRACE_FRAMES
-                    logger.info(f"🕐 AI stopped speaking - starting {POST_AI_GRACE_MS}ms grace period ({POST_AI_GRACE_FRAMES} frames)")
-                    prev_ai_speaking = False
-                
-                # CRITICAL: Post-AI-speech grace period countdown
-                # After AI stops, ignore all audio for N frames to avoid echo/noise triggering new utterance
+                    logger.info(
+                        f"🕐 AI stopped speaking - starting {POST_AI_GRACE_MS}ms grace period ({POST_AI_GRACE_FRAMES} frames)"
+                    )
+
+                prev_ai_speaking = self.ai_is_speaking
+
+                # AI playback guard: ignore everything until guard window passes
+                if self.ai_is_speaking:
+                    if time.time() < self._ai_playback_guard_deadline:
+                        continue
+
+                    barge_peak_threshold = max(BARGE_PEAK_MIN, noise_floor * 32767 * 12)
+                    if energy_peak > barge_peak_threshold and snr_db >= BARGE_SNR_DB:
+                        consecutive_barge_frames += 1
+                    else:
+                        consecutive_barge_frames = 0
+
+                    if consecutive_barge_frames >= BARGE_MIN_FRAMES:
+                        logger.info(
+                            f"🛑 BARGE-IN ACCEPTED (peak={energy_peak}, snr={snr_db:.1f} dB, "
+                            f"threshold={barge_peak_threshold:.0f}, frames={consecutive_barge_frames})"
+                        )
+                        await self.cancel_tts()
+                        self.ai_is_speaking = False
+                        speaking = False
+                        buffer.clear()
+                        silence_frames = 0
+                        consecutive_start_frames = 0
+                        post_ai_grace_frames = POST_AI_GRACE_FRAMES
+                        continue
+
+                    logger.debug(
+                        f"Ignoring audio while AI speaking (peak={energy_peak}, snr={snr_db:.1f} dB, "
+                        f"barge_frames={consecutive_barge_frames}/{BARGE_MIN_FRAMES})"
+                    )
+                    continue
+
                 if post_ai_grace_frames > 0:
                     post_ai_grace_frames -= 1
-                    if post_ai_grace_frames % 10 == 0:  # Log every 200ms
-                        logger.debug(f"VAD grace period active ({post_ai_grace_frames} frames remaining) - energy={energy}")
+                    if post_ai_grace_frames % 10 == 0:
+                        logger.debug(
+                            f"Post-AI grace active ({post_ai_grace_frames} frames left) peak={energy_peak}"
+                        )
                     continue
-                
-                # Update rolling energy window for adaptive tracking
-                recent_energy_window.append(energy)
-                if len(recent_energy_window) > ENERGY_WINDOW_SIZE:
-                    recent_energy_window.pop(0)
-                
-                # Adaptive two-tier VAD: different thresholds for start vs continuation
-                # Use high threshold for initial detection, lower threshold once speaking to allow mid-sentence pauses
-                active_threshold = CONTINUE_THRESHOLD if speaking else START_THRESHOLD
-                
-                if energy > active_threshold:
-                    if not speaking:
-                        # CRITICAL: Require consecutive voiced frames before accepting speech start
-                        # This prevents single-frame noise spikes from triggering false utterances
-                        consecutive_voiced += 1
-                        if consecutive_voiced < MIN_CONSECUTIVE_VOICED:
-                            logger.debug(f"Consecutive voiced {consecutive_voiced}/{MIN_CONSECUTIVE_VOICED} - energy={energy}")
-                            continue
-                        # Threshold met: accept as speech start
-                        logger.info(f"Speech detected! Energy={energy} (threshold={START_THRESHOLD}, consecutive={consecutive_voiced})")
-                        consecutive_voiced = 0  # Reset for next utterance
-                        # reset counters at start of utterance
-                        voiced_frames = 0
-                        total_frames_in_utt = 0
-                        recent_energy_window = [energy]  # Reset window
+
+                dynamic_start = max(BASE_START, noise_floor * 32767 * 8)
+                dynamic_continue = max(BASE_CONTINUE, noise_floor * 32767 * 5)
+
+                if not speaking:
+                    if energy_peak > dynamic_start and snr_db >= START_SNR_DB:
+                        consecutive_start_frames += 1
                     else:
-                        # Already speaking: reset consecutive counter (not used during continuation)
-                        consecutive_voiced = 0
-                    speaking = True
-                    silence_frames = 0
-                    buffer.extend(raw_bytes)
-                    total_frames_in_utt += 1
-                    voiced_frames += 1
+                        consecutive_start_frames = 0
+
+                    if consecutive_start_frames >= MIN_CONSECUTIVE_START:
+                        speaking = True
+                        speech_start_time = time.time()
+                        buffer = bytearray()
+                        silence_frames = 0
+                        logger.info(
+                            f"🎤 Speech START detected (peak={energy_peak}, snr={snr_db:.1f} dB, "
+                            f"dyn_start={dynamic_start:.0f})"
+                        )
+                    continue
+
+                buffer.extend(raw_bytes)
+
+                is_silence_frame = (energy_peak < dynamic_continue) or (snr_db < 4.0)
+                if is_silence_frame:
+                    silence_frames += 1
                 else:
-                    # Below threshold: reset consecutive voiced counter if not speaking
-                    if not speaking:
-                        consecutive_voiced = 0
-                    if speaking:
-                        # Check if this is truly silence or just a brief dip
-                        # Use recent energy average to avoid cutting on momentary quiet syllables
-                        avg_recent = sum(recent_energy_window) / max(len(recent_energy_window), 1)
-                        if avg_recent < CONTINUE_THRESHOLD:
-                            silence_frames += 1
-                        else:
-                            # Recent frames were loud enough; reset silence counter (brief dip)
-                            silence_frames = 0
-                        
-                        buffer.extend(raw_bytes)
-                        total_frames_in_utt += 1
-                        
-                        if silence_frames > SILENCE_FRAME_COUNT:
-                            # End of utterance
-                            logger.info(f"End of utterance detected after {len(buffer)} bytes. Processing...")
-                            
-                            # Copy buffer before resetting
-                            audio_data = bytes(buffer)
-                            buffer = bytearray()
-                            speaking = False
-                            silence_frames = 0
+                    silence_frames = 0
 
-                            # Utterance quality gating: drop low-information/noise segments
-                            utter_ms = int(total_frames_in_utt * (FRAME_DURATION * 1000))
-                            voiced_ratio = (voiced_frames / max(total_frames_in_utt, 1)) if total_frames_in_utt else 0.0
-                            if utter_ms < MIN_UTTER_MS or voiced_frames < MIN_VOICED_FRAMES or voiced_ratio < MIN_VOICED_RATIO:
-                                logger.info(f"🛑 Dropping low-information utterance (voiced={voiced_frames}, total={total_frames_in_utt}, ms={utter_ms}, ratio={voiced_ratio:.2f})")
-                                voiced_frames = 0
-                                total_frames_in_utt = 0
-                                continue
-                            
-                            # reset for next utterance window
-                            voiced_frames = 0
-                            total_frames_in_utt = 0
+                utterance_ready = False
+                if silence_frames >= SILENCE_FRAME_COUNT and len(buffer) >= MIN_BUFFER_BYTES:
+                    utterance_ready = True
+                    logger.info(
+                        f"✅ Utterance complete: speech+silence window hit (buffer={len(buffer)} bytes, "
+                        f"silence_frames={silence_frames})"
+                    )
+                elif len(buffer) >= MAX_UTTERANCE_BYTES:
+                    utterance_ready = True
+                    logger.warning(
+                        f"⏳ Max utterance reached ({MAX_UTTERANCE_MS}ms). Forcing STT dispatch (buffer={len(buffer)} bytes)"
+                    )
 
-                            # Guard: only process when controller expects input
-                            expected_id = getattr(getattr(self, 'session', None), 'expected_user_utterance_id', None)
-                            current_phase = getattr(getattr(self, 'session', None), 'phase', None)
+                if not utterance_ready:
+                    continue
 
-                            if current_phase and current_phase != ConversationPhase.WAIT_FOR_USER:
-                                logger.info(f"🛑 Dropping buffered audio because phase is {current_phase}, not WAIT_FOR_USER")
-                                continue
+                audio_data = bytes(buffer)
+                buffer = bytearray()
+                speaking = False
+                silence_frames = 0
 
-                            if expected_id and expected_id == self._last_consumed_utterance_id:
-                                logger.info(f"🛑 Duplicate end-of-utterance for already processed id {expected_id}; skipping")
-                                continue
+                expected_id = getattr(getattr(self, "session", None), "expected_user_utterance_id", None)
+                current_phase = getattr(getattr(self, "session", None), "phase", None)
 
-                            if current_phase == ConversationPhase.WAIT_FOR_USER and not expected_id:
-                                logger.warning("🛑 No expected_user_utterance_id set while waiting; dropping buffer to avoid duplicate STT")
-                                continue
-                            
-                            logger.info(f"🔊 Calling STT for {len(audio_data)} bytes of audio...")
-                            
-                            try:
-                                transcript = await self.orchestrator.stt.transcribe(audio_data)
-                                logger.info(f"✅ STT returned: '{transcript}' (length: {len(transcript)})")
-                            except Exception as e:
-                                logger.error(f"❌ STT failed: {e}", exc_info=True)
-                                transcript = ""
+                if current_phase and current_phase != ConversationPhase.WAIT_FOR_USER:
+                    logger.info(f"🛑 Dropping buffered audio because phase is {current_phase}, not WAIT_FOR_USER")
+                    continue
 
-                            if not transcript.strip():
-                                logger.warning(f"⚠️ Empty transcript, skipping utterance")
-                                continue
-                            
-                            logger.info(f"📝 Transcript received: '{transcript}' - forwarding to controller")
+                if expected_id and expected_id == self._last_consumed_utterance_id:
+                    logger.info(f"🛑 Duplicate end-of-utterance for already processed id {expected_id}; skipping")
+                    continue
 
-                            # Freeze the utterance id we intend to consume
-                            # CRITICAL: Re-check expected_id hasn't changed (guards against race condition)
-                            utterance_id = expected_id or str(uuid.uuid4())
-                            
-                            # Validate the expected_id is still valid (hasn't been updated to next utterance)
-                            current_expected = getattr(getattr(self, 'session', None), 'expected_user_utterance_id', None)
-                            if expected_id and current_expected and expected_id != current_expected:
-                                logger.warning(f"⚠️ Utterance ID mismatch: expected_id changed from {expected_id} to {current_expected} during STT")
-                                logger.warning(f"   Skipping stale transcript to prevent response mix-up")
-                                continue
-                            
-                            # Emit a user transcript event to UI before controller handling
-                            await self._notify({
-                                'type': 'transcript',
-                                'role': 'user',
-                                'text': transcript,
-                                'utteranceId': utterance_id,
-                                'roomId': self.room_id,
-                                'timestamp': time.time(),
-                            })
+                if current_phase == ConversationPhase.WAIT_FOR_USER and not expected_id:
+                    logger.warning(
+                        "🛑 No expected_user_utterance_id set while waiting; dropping buffer to avoid duplicate STT"
+                    )
+                    continue
 
-                            if hasattr(self, 'controller') and self.controller:
-                                logger.info(f"🎮 Controller exists, calling handle_user_utterance...")
-                                try:
-                                    # Use lock to serialize utterance processing - one at a time
-                                    async with self._utterance_processing_lock:
-                                        await self.controller.handle_user_utterance(transcript, utterance_id)
-                                        self._last_consumed_utterance_id = utterance_id
-                                    logger.info(f"✅ Controller processing completed")
-                                except Exception as e:
-                                    logger.error(f"❌ Controller handling failed: {e}", exc_info=True)
-                            else:
-                                logger.warning("⚠️ No controller found, skipping processing")
-                                persona_slug = "default"
-                                try:
-                                    from ai_agent.models import Call
-                                    
-                                    @database_sync_to_async
-                                    def get_fallback_persona():
-                                        call = Call.objects.filter(room__id=self.room_id).order_by('-started_at').first()
-                                        if call and call.persona:
-                                            return call.persona.slug
-                                        return "default"
-                                    
-                                    persona_slug = await get_fallback_persona()
-                                except Exception:
-                                    pass
+                if len(audio_data) < MIN_BUFFER_BYTES:
+                    logger.info(
+                        f"⏳ Buffer too small at finalize ({len(audio_data)} bytes / "
+                        f"{len(audio_data) / (48000 * 2) * 1000:.0f}ms < {MIN_BUFFER_MS}ms); extending capture..."
+                    )
+                    continue
 
-                                result = await self.orchestrator.handle_utterance(self.room_id, audio_data, persona_slug)
-                                if result and result.get('tts_audio'):
-                                    await self.queue_audio_output(result['tts_audio'])
+                if utterance_in_flight:
+                    logger.warning(
+                        f"⚠️ STT already in flight for utterance {current_utterance_id}; skipping duplicate dispatch"
+                    )
+                    continue
+
+                effective_sample_rate = capture_sample_rate or 48000
+                audio_duration_ms = int(len(audio_data) / (effective_sample_rate * 2) * 1000)
+                speech_end_time = time.time()
+                total_utterance_duration = (
+                    (speech_end_time - speech_start_time) if speech_start_time else audio_duration_ms / 1000.0
+                )
+
+                current_utterance_id = expected_id or str(uuid.uuid4())
+                utterance_in_flight = True
+
+                logger.info("")
+                logger.info("═══════════════════════════════════════════════════════════")
+                logger.info("🔊 SINGLE STT CALL - Complete user turn captured")
+                logger.info(f"   Utterance ID: {current_utterance_id}")
+                logger.info(f"   Audio buffer: {len(audio_data)} bytes = {audio_duration_ms}ms")
+                logger.info(f"   Total duration: {total_utterance_duration:.1f}s (from speech start to now)")
+                logger.info(f"   Finalization trigger: {SILENCE_DURATION_MS}ms continuous silence")
+                logger.info("═══════════════════════════════════════════════════════════")
+                logger.info("")
+
+                try:
+                    await self._save_utterance_audio(
+                        audio_bytes=audio_data,
+                        utterance_id=current_utterance_id,
+                        duration_ms=audio_duration_ms,
+                        sample_rate=effective_sample_rate,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to save utterance audio ({current_utterance_id}): {e}")
+
+                try:
+                    prepared_bytes, prep_metrics = self._prepare_audio_for_stt(audio_data, effective_sample_rate)
+                    logger.info(
+                        f"🎧 STT prep metrics: dur={prep_metrics['duration_ms']:.0f}ms "
+                        f"rms={prep_metrics['rms']:.4f} snr={prep_metrics['snr_db']:.1f}dB peak={prep_metrics['peak']:.3f}"
+                    )
+
+                    try:
+                        await self._save_conditioned_audio(
+                            audio_bytes=prepared_bytes,
+                            utterance_id=current_utterance_id,
+                            duration_ms=int(prep_metrics["duration_ms"]),
+                            sample_rate=48000,
+                        )
+                    except Exception:
+                        pass
+
+                    if (
+                        prep_metrics["duration_ms"] < STT_MIN_DURATION_MS
+                        or prep_metrics["rms"] < STT_MIN_RMS
+                        or prep_metrics["snr_db"] < STT_MIN_SNR_DB
+                    ):
+                        logger.warning(
+                            "🛑 Prepared audio below floor (dur/rms/snr). Requesting repeat without STT call."
+                        )
+                        await self._notify(
+                            {
+                                "type": "transcript",
+                                "role": "assistant",
+                                "text": "I couldn't hear that clearly. Could you please repeat?",
+                                "turnId": self.session.last_ai_turn_id,
+                                "roomId": self.room_id,
+                                "timestamp": time.time(),
+                            }
+                        )
+                        utterance_in_flight = False
+                        await self.controller._set_waiting_for_user()
+                        continue
+
+                    transcript = await self.orchestrator.stt.transcribe(prepared_bytes)
+                    logger.info(
+                        f"✅ STT returned ({len(transcript)} chars, utterance_id={current_utterance_id}): '{transcript}'"
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"❌ STT or preparation failed for utterance_id={current_utterance_id}: {e}",
+                        exc_info=True,
+                    )
+                    transcript = ""
+                finally:
+                    utterance_in_flight = False
+
+                if not transcript.strip():
+                    logger.warning(f"⚠️ Empty transcript for utterance_id={current_utterance_id}, skipping")
+                    continue
+
+                await self._notify(
+                    {
+                        "type": "transcript",
+                        "role": "user",
+                        "text": transcript,
+                        "utteranceId": current_utterance_id,
+                        "roomId": self.room_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                if hasattr(self, "controller") and self.controller:
+                    logger.info(
+                        f"🎮 Controller exists, calling handle_user_utterance with utterance_id={current_utterance_id}..."
+                    )
+                    try:
+                        async with self._utterance_processing_lock:
+                            await self.controller.handle_user_utterance(transcript, current_utterance_id)
+                            self._last_consumed_utterance_id = current_utterance_id
+                        logger.info(f"✅ Controller processing completed for utterance_id={current_utterance_id}")
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Controller handling failed for utterance_id={current_utterance_id}: {e}",
+                            exc_info=True,
+                        )
+                else:
+                    logger.warning("⚠️ No controller found, skipping processing")
+                    persona_slug = "default"
+                    try:
+                        from ai_agent.models import Call
+
+                        @database_sync_to_async
+                        def get_fallback_persona():
+                            call = Call.objects.filter(room__id=self.room_id).order_by("-started_at").first()
+                            if call and call.persona:
+                                return call.persona.slug
+                            return "default"
+
+                        persona_slug = await get_fallback_persona()
+                    except Exception:
+                        pass
+
+                    result = await self.orchestrator.handle_utterance(self.room_id, audio_data, persona_slug)
+                    if result and result.get("tts_audio"):
+                        await self.queue_audio_output(result["tts_audio"])
         except Exception as e:
             logger.error(f"Error in audio processing: {e}")
+
+    async def _save_utterance_audio(self, audio_bytes: bytes, utterance_id: str, duration_ms: int, sample_rate: int = 48000):
+        """Save the exact audio buffer being sent to STT for offline testing.
+
+        - Saves raw PCM (s16le mono) for exact byte-level match with STT input
+        - Also saves a WAV copy (48kHz mono) for easy playback/inspection
+        - Files are stored under backend/test_recordings/{roomId}/
+        """
+        try:
+            import os
+            import io
+            import wave
+            from pathlib import Path
+
+            # Allow disabling via env flag if desired
+            record_flag = os.environ.get("RECORD_UTTERANCES", "true").lower() in {"1", "true", "yes", "on"}
+            if not record_flag:
+                return
+
+            backend_root = Path(__file__).resolve().parents[1]  # .../backend
+            out_dir = backend_root / "test_recordings" / str(self.room_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            ts = int(time.time() * 1000)
+            base_name = f"{ts}__{utterance_id}__{duration_ms}ms"
+
+            # 1) Save raw PCM exactly as sent to STT
+            pcm_path = out_dir / f"{base_name}.pcm"
+            async def _write_pcm():
+                with open(pcm_path, "wb") as f:
+                    f.write(audio_bytes)
+
+            # 2) Save WAV copy for convenience
+            wav_path = out_dir / f"{base_name}.wav"
+            async def _write_wav():
+                with io.BytesIO() as bio:
+                    with wave.open(bio, 'wb') as wav:
+                        wav.setnchannels(1)
+                        wav.setsampwidth(2)
+                        wav.setframerate(sample_rate)
+                        wav.writeframes(audio_bytes)
+                    data = bio.getvalue()
+                with open(wav_path, "wb") as f:
+                    f.write(data)
+
+            # Perform writes in thread to avoid blocking event loop
+            await asyncio.gather(
+                asyncio.to_thread(lambda: asyncio.run(_write_pcm())),
+                asyncio.to_thread(lambda: asyncio.run(_write_wav()))
+            )
+
+            logger.info(f"💾 Saved utterance audio to: {pcm_path} and {wav_path}")
+        except Exception as e:
+            logger.warning(f"Audio save failed: {e}")
+
+    async def _save_conditioned_audio(self, audio_bytes: bytes, utterance_id: str, duration_ms: int, sample_rate: int = 48000):
+        """Save conditioned audio buffer as WAV for inspection alongside raw.
+
+        Files are stored under backend/test_recordings/{roomId}/ and suffixed with '__cond.wav'.
+        """
+        try:
+            import io
+            import wave
+            from pathlib import Path
+
+            backend_root = Path(__file__).resolve().parents[1]
+            out_dir = backend_root / "test_recordings" / str(self.room_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            ts = int(time.time() * 1000)
+            wav_path = out_dir / f"{ts}__{utterance_id}__{duration_ms}ms__cond.wav"
+
+            with io.BytesIO() as bio:
+                with wave.open(bio, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(sample_rate)
+                    wav.writeframes(audio_bytes)
+                data = bio.getvalue()
+
+            with open(wav_path, "wb") as f:
+                f.write(data)
+
+            logger.info(f"💾 Saved conditioned audio to: {wav_path}")
+        except Exception as e:
+            logger.debug(f"Conditioned audio save failed: {e}")
 
     async def queue_audio_output(self, audio_bytes, turn_id: str | None = None):
         """
@@ -547,6 +748,10 @@ class WebRTCManager:
         
         # FIRST: Set flag BEFORE pushing any audio to queue
         self.ai_is_speaking = True
+        # Ignore barge-in during initial playback ramp
+        self._ai_playback_guard_deadline = time.time() + 0.6
+        # Reset cancel flag
+        self._tts_cancel_event.clear()
         # Notify UI that playback is starting for this turn (if available)
         try:
             if turn_id:
@@ -568,6 +773,9 @@ class WebRTCManager:
             CHUNK_SIZE = 1920  # 960 samples * 2 bytes = 20ms at 48kHz
             chunks_queued = 0
             for i in range(0, len(audio_bytes), CHUNK_SIZE):
+                if self._tts_cancel_event.is_set():
+                    logger.info("⏹️  TTS playback canceled mid-stream; stopping queueing further chunks")
+                    break
                 chunk = audio_bytes[i:i+CHUNK_SIZE]
                 if chunk:  # Only queue non-empty chunks
                     await self.ai_track.q.put(chunk)
@@ -575,10 +783,13 @@ class WebRTCManager:
             
             logger.info(f"🔊 Queued {chunks_queued} chunks ({duration_seconds:.2f}s of audio) - VAD disabled to prevent echo")
             
-            # CRITICAL: Wait for audio to finish playing before re-enabling VAD
+            # CRITICAL: Wait for audio to finish OR cancel event, before re-enabling VAD
             # Add 15% buffer to ensure playback completes + any codec/network jitter
             wait_time = duration_seconds * 1.15
-            await asyncio.sleep(wait_time)
+            try:
+                await asyncio.wait_for(self._wait_or_cancel(wait_time), timeout=wait_time + 0.1)
+            except asyncio.TimeoutError:
+                pass
             
         finally:
             # ALWAYS re-enable VAD, even if there was an error
@@ -589,13 +800,38 @@ class WebRTCManager:
                 if turn_id:
                     await self._notify({
                         'type': 'ai_playback',
-                        'status': 'end',
+                        'status': 'canceled' if self._tts_cancel_event.is_set() else 'end',
                         'turnId': turn_id,
                         'roomId': self.room_id,
                         'timestamp': time.time(),
                     })
             except Exception:
                 pass
+
+    async def _wait_or_cancel(self, seconds: float):
+        """Wait for given seconds or until cancel is signaled, whichever comes first."""
+        try:
+            await asyncio.wait_for(self._tts_cancel_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def cancel_tts(self):
+        """Signal cancellation and drain any queued audio to stop playback quickly."""
+        try:
+            if not self.ai_is_speaking:
+                return
+            self._tts_cancel_event.set()
+            # Drain queue non-blocking
+            drained = 0
+            while not self.ai_track.q.empty():
+                try:
+                    _ = self.ai_track.q.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            logger.info(f"🧹 Drained {drained} queued audio chunks after cancel")
+        except Exception as e:
+            logger.debug(f"cancel_tts error: {e}")
 
     async def handle_candidate(self, candidate_data):
         # GUARD: Skip all candidate handling if manager is closing
@@ -674,6 +910,54 @@ class WebRTCManager:
             self.pc = None
         
         logger.info(f"✅ WebRTCManager closed for room {self.room_id}")
+
+    def _prepare_audio_for_stt(self, audio_bytes: bytes, sample_rate: int = 48000):
+        """Trim edges, normalize loudness, and compute simple metrics for STT input."""
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            return audio_bytes, {"duration_ms": 0.0, "rms": 0.0, "snr_db": -60.0, "peak": 0.0}
+
+        samples /= 32767.0
+
+        window = max(int(0.02 * sample_rate), 1)
+        abs_samples = np.abs(samples)
+        noise_est = float(np.median(abs_samples))
+        trim_threshold = max(noise_est * 3.0, 0.003)
+
+        start_idx = 0
+        for i in range(0, len(samples), window):
+            if np.sqrt(np.mean(abs_samples[i:i + window] ** 2)) > trim_threshold:
+                start_idx = max(0, i - window)
+                break
+
+        end_idx = len(samples)
+        for i in range(len(samples) - window, 0, -window):
+            if np.sqrt(np.mean(abs_samples[i:i + window] ** 2)) > trim_threshold:
+                end_idx = min(len(samples), i + 2 * window)
+                break
+
+        trimmed = samples[start_idx:end_idx] if end_idx > start_idx else samples
+
+        rms = float(np.sqrt(np.mean(trimmed ** 2))) if trimmed.size else 0.0
+        peak = float(np.max(np.abs(trimmed))) if trimmed.size else 0.0
+        snr_db = 20 * np.log10(max(rms, 1e-6) / max(noise_est, 1e-6)) if trimmed.size else -60.0
+
+        target_rms = 0.1
+        if rms > 0:
+            gain = min(4.0, target_rms / max(rms, 1e-6))
+            trimmed = np.clip(trimmed * gain, -0.97, 0.97)
+            rms = float(np.sqrt(np.mean(trimmed ** 2)))
+            peak = float(np.max(np.abs(trimmed)))
+
+        duration_ms = len(trimmed) / sample_rate * 1000 if sample_rate else 0.0
+        prepared_bytes = (trimmed * 32767.0).astype(np.int16).tobytes()
+
+        return prepared_bytes, {
+            "duration_ms": duration_ms,
+            "rms": rms,
+            "snr_db": snr_db,
+            "peak": peak,
+        }
 
     async def _notify(self, message: dict):
         """Send a UI event if a notify callback is available."""
