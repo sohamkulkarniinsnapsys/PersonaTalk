@@ -46,7 +46,8 @@ function StreamingText({ text, isStreaming, role }: StreamingTextProps) {
 
     // Use requestAnimationFrame for smooth 60fps animation
     // Add characters at ~50 chars/sec (20ms per char = ~100 chars visible per frame)
-    const charDelay = 20; // milliseconds per character
+    // Slow down to roughly match spoken pace (~12-15 chars/sec)
+    const charDelay = 80; // milliseconds per character
     const timeout = setTimeout(() => {
       const newPos = displayedCursorPos + 1;
       setDisplayedCursorPos(newPos);
@@ -85,23 +86,29 @@ interface MessageItemProps {
   item: TranscriptItem;
   isVisible: boolean;
   personaName?: string;
+  playbackStartedTurns?: Set<string>;
 }
 
 /**
  * Individual message with delayed display capability.
  * Used to sync assistant messages with audio playback.
  */
-function MessageItem({ item, isVisible, personaName }: MessageItemProps) {
+function MessageItem({ item, isVisible, personaName, playbackStartedTurns }: MessageItemProps) {
   if (!isVisible) {
     return null; // Hidden until delay expires
   }
+
+  // Stream assistant text only while its turn is actively playing audio
+  const isStreamingActive = item.role === 'assistant'
+    ? Boolean(item.turnId && playbackStartedTurns?.has(item.turnId))
+    : false;
 
   return (
     <div
       className={`flex transition-all duration-300 ${item.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2`}
     >
       <div
-        className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap break-words transition-all duration-600 ${
+        className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap break-words transition-all duration-1300 ${
           item.role === 'user'
             ? 'bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-lg shadow-blue-500/20'
             : item.isStreaming
@@ -112,7 +119,7 @@ function MessageItem({ item, isVisible, personaName }: MessageItemProps) {
       >
         <StreamingText
           text={item.text}
-          isStreaming={item.isStreaming || false}
+          isStreaming={isStreamingActive || item.isStreaming || false}
           role={item.role}
         />
       </div>
@@ -160,11 +167,10 @@ export function TranscriptPanel({
       // For AI/assistant messages, gate visibility on playback start signal
       // Show when either:
       // 1) We received ai_playback start for this turnId
-      // 2) aiSpeaking toggled true after this message arrived
-      // 3) Fallback timeout (max wait) to avoid never showing
+      // 2) Fallback timeout (max wait) to avoid never showing
       const checkAndReveal = () => {
         const started = !!(item.turnId && playbackStartedTurns && playbackStartedTurns.has(item.turnId));
-        if (started || aiSpeaking) {
+        if (started) {
           setVisibleItems(prev => new Set(prev).add(idx));
           return true;
         }
@@ -187,7 +193,7 @@ export function TranscriptPanel({
 
       return () => clearInterval(interval);
     });
-  }, [items, visibleItems, aiSpeaking, playbackStartedTurns]);
+  }, [items, visibleItems, playbackStartedTurns]);
 
   // Auto-scroll to bottom when new visible messages arrive
   useEffect(() => {
@@ -235,6 +241,7 @@ export function TranscriptPanel({
               item={item}
               isVisible={visibleItems.has(idx)}
               personaName={personaName}
+              playbackStartedTurns={playbackStartedTurns}
             />
           ))
         )}

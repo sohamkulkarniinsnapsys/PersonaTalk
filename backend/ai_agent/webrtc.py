@@ -13,6 +13,9 @@ from aioice.stun import TransactionTimeout
 from .ai_orchestrator import AIOrchestrator
 from .conversation import ConversationPhase
 from .audio_conditioning import AudioConditioner
+from .persona_behaviors import get_behavior_for_persona
+from .barge_in_state_machine import BargeinStateMachine, BargeinState
+from .stop_word_interruption import StopWordInterruptor, InterruptionTier
 from typing import Deque
 from collections import deque
 
@@ -153,6 +156,15 @@ class WebRTCManager:
         self.rolling_transcripts: Deque[str] = deque(maxlen=3)  # Keep last 3 transcripts
         # Guard window after AI playback starts (barge-in ignored during this window)
         self._ai_playback_guard_deadline: float = 0.0
+        # Barge-in state machine (will be initialized after persona is loaded)
+        self.barge_in_machine = None
+        # Stop-word interruption (semantic control during AI speech)
+        self.stop_interruptor = StopWordInterruptor(check_interval_ms=500)
+        self._stopword_buffer = bytearray()
+        self._ai_playback_started_at: float | None = None
+        # Track consecutive empty stop-check STT results during AI playback
+        self._stopcheck_empty_count: int = 0
+        self._last_stopcheck_ts: float = 0.0
 
     async def handle_offer(self, sdp, type_):
         # CRITICAL: Only handle the FIRST offer per manager
@@ -250,6 +262,11 @@ class WebRTCManager:
                             notify_callback=self._notify
                         )
                         
+                        # Initialize persona-aware barge-in behavior
+                        barge_behavior = get_behavior_for_persona(persona_slug, persona_config)
+                        self.barge_in_machine = BargeinStateMachine(barge_behavior)
+                        logger.info(f"✅ Initialized intelligent barge-in for persona '{persona_slug}'")
+                        
                         # Start controller (speak first) asynchronously (don't block negotiation)
                         asyncio.ensure_future(self.controller.start())
                         logger.info(f"Conversation controller started for room {self.room_id} with persona {persona_slug}")
@@ -310,8 +327,8 @@ class WebRTCManager:
         MAX_UTTERANCE_MS = int(os.environ.get("VAD_MAX_UTTERANCE_MS", "30000"))
         MAX_UTTERANCE_BYTES = int(MAX_UTTERANCE_MS * 48000 * 2 / 1000)
 
-        START_SNR_DB = float(os.environ.get("VAD_START_SNR_DB", "10"))
-        MIN_CONSECUTIVE_START = int(os.environ.get("VAD_MIN_CONSECUTIVE_START", "6"))
+        START_SNR_DB = float(os.environ.get("VAD_START_SNR_DB", "6"))  # REDUCED from 10 to be more sensitive
+        MIN_CONSECUTIVE_START = int(os.environ.get("VAD_MIN_CONSECUTIVE_START", "3"))  # REDUCED from 6 (60ms vs 120ms)
         POST_AI_GRACE_MS = int(os.environ.get("VAD_POST_AI_GRACE_MS", "1200"))
         POST_AI_GRACE_FRAMES = int(POST_AI_GRACE_MS / (FRAME_DURATION * 1000))
 
@@ -328,7 +345,7 @@ class WebRTCManager:
         speaking = False
         frame_count = 0
         consecutive_start_frames = 0
-        consecutive_barge_frames = 0
+        # OLD: consecutive_barge_frames = 0 (replaced by state machine)
         post_ai_grace_frames = 0
         speech_start_time = None
         utterance_in_flight = False
@@ -338,6 +355,10 @@ class WebRTCManager:
         logger.info(
             f"VAD settings: start>={BASE_START}, continue>={BASE_CONTINUE}, silence={SILENCE_DURATION_MS}ms, "
             f"min_buffer={MIN_BUFFER_MS}ms, barge_min_peak={BARGE_PEAK_MIN}, barge_frames={BARGE_MIN_FRAMES}"
+        )
+        logger.info(
+            f"VAD sensitivity: START_SNR_DB={START_SNR_DB}dB, MIN_CONSECUTIVE_START={MIN_CONSECUTIVE_START} frames (60ms), "
+            f"Grace period={POST_AI_GRACE_MS}ms with 1.3x multiplier"
         )
 
         try:
@@ -395,48 +416,278 @@ class WebRTCManager:
                     )
 
                 prev_ai_speaking = self.ai_is_speaking
+                expected_id = getattr(getattr(self, "session", None), "expected_user_utterance_id", None)
 
-                # AI playback guard: ignore everything until guard window passes
-                if self.ai_is_speaking:
-                    if time.time() < self._ai_playback_guard_deadline:
-                        continue
-
-                    barge_peak_threshold = max(BARGE_PEAK_MIN, noise_floor * 32767 * 12)
-                    if energy_peak > barge_peak_threshold and snr_db >= BARGE_SNR_DB:
-                        consecutive_barge_frames += 1
-                    else:
-                        consecutive_barge_frames = 0
-
-                    if consecutive_barge_frames >= BARGE_MIN_FRAMES:
-                        logger.info(
-                            f"🛑 BARGE-IN ACCEPTED (peak={energy_peak}, snr={snr_db:.1f} dB, "
-                            f"threshold={barge_peak_threshold:.0f}, frames={consecutive_barge_frames})"
-                        )
-                        await self.cancel_tts()
-                        self.ai_is_speaking = False
-                        speaking = False
-                        buffer.clear()
-                        silence_frames = 0
-                        consecutive_start_frames = 0
-                        post_ai_grace_frames = POST_AI_GRACE_FRAMES
-                        continue
-
-                    logger.debug(
-                        f"Ignoring audio while AI speaking (peak={energy_peak}, snr={snr_db:.1f} dB, "
-                        f"barge_frames={consecutive_barge_frames}/{BARGE_MIN_FRAMES})"
+                # ========== INTELLIGENT BARGE-IN: TWO-STAGE INTERRUPTION PIPELINE ==========
+                # Stage 1: Speech Validation (sustained energy check)
+                # Stage 2: Query Validation (preliminary STT + heuristics)
+                # Only accept interruption if BOTH stages pass
+                # ==========================================================================
+                
+                # DIAGNOSTIC: Log AI speaking state every 50 frames to debug why stop-check doesn't run
+                if frame_count % 50 == 0:
+                    current_time = time.time()
+                    guard_remaining = max(0, self._ai_playback_guard_deadline - current_time)
+                    logger.info(
+                        f"🔍 [DIAGNOSTIC] Frame {frame_count}: ai_is_speaking={self.ai_is_speaking}, "
+                        f"guard_remaining={guard_remaining:.2f}s, guard_deadline={self._ai_playback_guard_deadline:.2f}, "
+                        f"current_time={current_time:.2f}"
                     )
-                    continue
+                
+                if self.ai_is_speaking:
+                    # Guard window: Ignore initial 400ms to prevent false triggers from playback ramp
+                    current_time = time.time()
+                    if current_time < self._ai_playback_guard_deadline:
+                        if frame_count % 50 == 0:
+                            logger.info(f"⏱️  [GUARD] Skipping stop-check: still in guard window ({self._ai_playback_guard_deadline - current_time:.2f}s remaining)")
+                        continue
 
+                    # Always accumulate a short rolling buffer during AI playback for stop-word detection.
+                    self._stopword_buffer.extend(raw_bytes)
+                    max_stop_bytes = int(2_000 * 48000 * 2 / 1000)  # ~2s
+                    if len(self._stopword_buffer) > max_stop_bytes:
+                        self._stopword_buffer = self._stopword_buffer[-max_stop_bytes:]
+
+                    # ULTRA-LOW threshold for stop-word detection (300ms = ~1 word)
+                    min_stop_bytes = int(300 * 48000 * 2 / 1000)  # 300ms
+
+                    # DEBUG: Log every frame during AI playback to diagnose throttle issues
+                    if frame_count % 25 == 0:  # Every 500ms
+                        logger.info(
+                            f"⏰ [stop-debug] AI speaking | buffer={len(self._stopword_buffer)} bytes ({len(self._stopword_buffer) / (48000 * 2) * 1000:.0f}ms), "
+                            f"min_needed={min_stop_bytes / (48000 * 2) * 1000:.0f}ms, will_check={self.stop_interruptor.should_check_now()}"
+                        )
+
+                    if len(self._stopword_buffer) >= min_stop_bytes and self.stop_interruptor.should_check_now():
+                        stop_buffer_ms = len(self._stopword_buffer) / (48000 * 2) * 1000
+                        logger.info(
+                            f"🛑 [stop-check] Triggered during AI playback | buffer_ms={stop_buffer_ms:.0f} "
+                            f"energy={energy_peak} snr={snr_db:.1f} guard_until={self._ai_playback_guard_deadline:.2f}"
+                        )
+                        try:
+                            prepared_bytes, prep_metrics = self._prepare_audio_for_stt(
+                                bytes(self._stopword_buffer), capture_sample_rate
+                            )
+                            logger.info(
+                                "[stop-check] prep metrics | dur=%.0fms rms=%.4f snr=%.1fdB peak=%.3f",
+                                prep_metrics.get("duration_ms", 0.0),
+                                prep_metrics.get("rms", 0.0),
+                                prep_metrics.get("snr_db", 0.0),
+                                prep_metrics.get("peak", 0.0),
+                            )
+
+                            # Skip stop-word STT when signal is clearly too weak to be meaningful
+                            if (
+                                prep_metrics.get("snr_db", 0.0) < 8.0
+                                or prep_metrics.get("rms", 0.0) < 0.002
+                            ):
+                                logger.info(
+                                    "↩️  [stop-check] Skipping stop-word check (snr=%.1fdB rms=%.4f) — keep AI speaking",
+                                    prep_metrics.get("snr_db", 0.0),
+                                    prep_metrics.get("rms", 0.0),
+                                )
+                                self.stop_interruptor.reset_check_timer()
+                                self._stopword_buffer.clear()
+                                self._stopcheck_empty_count = 0
+                                continue
+
+                            transcript = await self.orchestrator.stt.transcribe(prepared_bytes)
+
+                            # Retry once with boosted audio if transcript is empty but signal seems usable
+                            if not transcript.strip() and prep_metrics.get("duration_ms", 0.0) >= 250:
+                                boosted_bytes = self._boost_audio_for_stt(prepared_bytes, gain=3.0)
+                                logger.info("[stop-check] Empty transcript; retrying stop-word STT with boosted audio")
+                                transcript = await self.orchestrator.stt.transcribe(boosted_bytes)
+                            # Track empties and time for fallback logic
+                            now_ts = time.time()
+                            if not transcript.strip():
+                                # Increment if within a short window
+                                if now_ts - self._last_stopcheck_ts <= 2.0:
+                                    self._stopcheck_empty_count += 1
+                                else:
+                                    self._stopcheck_empty_count = 1
+                                self._last_stopcheck_ts = now_ts
+                            else:
+                                # Reset on any non-empty transcript
+                                self._stopcheck_empty_count = 0
+                                self._last_stopcheck_ts = now_ts
+                            time_in_ai_ms = 0.0
+                            if self._ai_playback_started_at:
+                                time_in_ai_ms = (time.time() - self._ai_playback_started_at) * 1000
+
+                            match = await self.stop_interruptor.check_for_stop_words(
+                                transcript=transcript,
+                                buffer_duration_ms=int(prep_metrics.get("duration_ms", 0)),
+                                stt_confidence=0.9,
+                                time_since_ai_start_ms=time_in_ai_ms,
+                                utterance_id=expected_id,
+                            )
+
+                            logger.info(
+                                "📝 [stop-check] Transcript result | "
+                                f"len={len(transcript)} text='{transcript[:80]}' match={match.matched} tier={getattr(match, 'tier', None)}"
+                            )
+
+                            if match.matched and match.tier == InterruptionTier.TIER_1_HARD:
+                                logger.info(
+                                    "🛑 Stop-word detected during AI speech; canceling TTS immediately | "
+                                    f"keyword='{match.keyword}' buffer_ms={prep_metrics.get('duration_ms', 0):.0f}"
+                                )
+                                await self.cancel_tts()
+                                self.ai_is_speaking = False
+                                self._ai_playback_guard_deadline = 0.0
+                                self._stopword_buffer.clear()
+                                self.stop_interruptor.reset_check_timer()
+                                if self.barge_in_machine:
+                                    self.barge_in_machine.reset()
+
+                                # Reset VAD state so the next user audio is captured cleanly
+                                speaking = False
+                                buffer = bytearray()
+                                silence_frames = 0
+                                consecutive_start_frames = 0
+                                post_ai_grace_frames = 0
+
+                                # Notify UI of control intent (no history/LLM impact)
+                                await self._notify(
+                                    {
+                                        "type": "stop_word",
+                                        "keyword": match.keyword or transcript,
+                                        "utteranceId": expected_id,
+                                        "roomId": self.room_id,
+                                        "timestamp": time.time(),
+                                    }
+                                )
+
+                                if hasattr(self, "controller") and self.controller:
+                                    await self.controller._notify_state(ConversationPhase.USER_OVERRIDE)
+                                    await self.controller._set_waiting_for_user()
+                                continue
+                            else:
+                                logger.info("ℹ️ [stop-check] No Tier-1 stop-word match; continuing AI playback")
+                                # Reset buffer/timer on empty transcripts to avoid repeated low-SNR checks
+                                if not transcript.strip():
+                                    self._stopword_buffer.clear()
+                                    self.stop_interruptor.reset_check_timer()
+                        except Exception as e:
+                            logger.warning(f"Stop-word detection failed: {e}")
+
+                    # Safety: Fall back to default behavior if barge_in_machine not initialized
+                    if self.barge_in_machine is None:
+                        logger.warning("⚠️ Barge-in machine not initialized; falling back to simple energy detection")
+                        # Fallback to old logic (simplified)
+                        barge_peak_threshold = max(BARGE_PEAK_MIN, noise_floor * 32767 * 12)
+                        if energy_peak > barge_peak_threshold and snr_db >= BARGE_SNR_DB:
+                            logger.info(f"🛑 SIMPLE BARGE-IN (fallback mode): peak={energy_peak}")
+                            await self.cancel_tts()
+                            self.ai_is_speaking = False
+                            speaking = False
+                            buffer.clear()
+                            silence_frames = 0
+                            consecutive_start_frames = 0
+                            post_ai_grace_frames = POST_AI_GRACE_FRAMES
+                        continue
+
+                    # Process frame through intelligent state machine (runs alongside stop-check)
+                    result = self.barge_in_machine.process_frame(
+                        energy_peak=energy_peak,
+                        snr_db=snr_db,
+                        raw_bytes=raw_bytes,
+                        noise_floor=noise_floor
+                    )
+
+                    action = result["action"]
+                    new_state = result["new_state"]
+                    reason = result["reason"]
+
+                    # Log state transitions at INFO level for visibility
+                    if frame_count % 25 == 0 or new_state != BargeinState.AI_SPEAKING:
+                        logger.info(
+                            f"🎮 Barge-in state: {new_state.value} | "
+                            f"action={action} | energy={energy_peak} | snr={snr_db:.1f} dB"
+                        )
+
+                    # Handle state machine actions
+                    if action == "accept_barge_in":
+                        logger.info("=" * 70)
+                        logger.info("✅ BARGE-IN ACCEPTED - Running Stage 2 Query Validation")
+                        logger.info(f"   Reason: {reason}")
+                        logger.info("=" * 70)
+
+                        # Stage 2: Validate query buffer
+                        query_buffer = result.get("query_buffer")
+                        if query_buffer:
+                            is_valid_query = await self.barge_in_machine.validate_query(
+                                query_buffer,
+                                self.orchestrator.stt
+                            )
+
+                            if is_valid_query:
+                                logger.info("✅ Stage 2 PASSED: Query is meaningful, accepting interruption")
+
+                                # Cancel AI speech
+                                await self.cancel_tts()
+                                self.ai_is_speaking = False
+
+                                # Reset VAD state for fresh user utterance
+                                speaking = False
+                                buffer.clear()
+                                silence_frames = 0
+                                consecutive_start_frames = 0
+                                post_ai_grace_frames = POST_AI_GRACE_FRAMES
+
+                                # Reset barge-in machine for next detection
+                                self.barge_in_machine.reset()
+
+                                # Log final decision
+                                logger.info(f"🎤 User interruption accepted, listening for full utterance")
+                                continue
+                            else:
+                                logger.info("❌ Stage 2 FAILED: Query validation rejected")
+                                logger.info(f"   Rejection reason: {self.barge_in_machine.context.rejection_reason}")
+                                # Reset and continue AI speech
+                                self.barge_in_machine.reset()
+                                continue
+                        else:
+                            logger.warning("⚠️  No query buffer available for validation; rejecting by default")
+                            self.barge_in_machine.reset()
+                            continue
+
+                    elif action == "reject_barge_in":
+                        # State machine explicitly rejected (logged inside machine)
+                        self.barge_in_machine.reset()
+                        continue
+
+                    elif action == "continue_ai":
+                        # Still validating; continue AI playback
+                        continue
+
+                    else:
+                        # Unknown action (shouldn't happen); log and continue
+                        logger.warning(f"⚠️  Unknown barge-in action: {action}")
+                        continue
+
+                # CRITICAL FIX: Grace period should slightly reduce sensitivity to prevent echo/artifacts
+                # BUT must still allow normal human speech (not 3x multiplier which blocks voice!)
+                # Previous fix was TOO AGGRESSIVE - users couldn't speak during grace period
                 if post_ai_grace_frames > 0:
                     post_ai_grace_frames -= 1
                     if post_ai_grace_frames % 10 == 0:
                         logger.debug(
                             f"Post-AI grace active ({post_ai_grace_frames} frames left) peak={energy_peak}"
                         )
-                    continue
+                    # Apply MODEST thresholds during grace period (1.3x multiplier instead of 3.0x)
+                    # This filters echo/artifacts without blocking legitimate speech
+                    grace_multiplier = 1.3  # Only require 1.3x normal energy during grace (not 3x!)
+                    dynamic_start = max(BASE_START * grace_multiplier, noise_floor * 32767 * 10)
+                    dynamic_continue = max(BASE_CONTINUE * grace_multiplier, noise_floor * 32767 * 6)
+                    # Fall through to VAD detection with slightly stricter thresholds
+                else:
+                    # Normal VAD thresholds when grace period is over - more sensitive for better voice capture
+                    dynamic_start = max(BASE_START, noise_floor * 32767 * 5)  # REDUCED from 8x to 5x
+                    dynamic_continue = max(BASE_CONTINUE, noise_floor * 32767 * 3)  # REDUCED from 5x to 3x
 
-                dynamic_start = max(BASE_START, noise_floor * 32767 * 8)
-                dynamic_continue = max(BASE_CONTINUE, noise_floor * 32767 * 5)
+                # Thresholds already calculated above based on grace period state
 
                 if not speaking:
                     if energy_peak > dynamic_start and snr_db >= START_SNR_DB:
@@ -453,11 +704,19 @@ class WebRTCManager:
                             f"🎤 Speech START detected (peak={energy_peak}, snr={snr_db:.1f} dB, "
                             f"dyn_start={dynamic_start:.0f})"
                         )
+                        # Emit USER_SPEAKING_START event to UI
+                        await self._notify({
+                            'type': 'speaking_state',
+                            'speaker': 'user',
+                            'state': 'start',
+                            'roomId': self.room_id,
+                            'timestamp': time.time(),
+                        })
                     continue
 
                 buffer.extend(raw_bytes)
 
-                is_silence_frame = (energy_peak < dynamic_continue) or (snr_db < 4.0)
+                is_silence_frame = (energy_peak < dynamic_continue) or (snr_db < 2.0)  # REDUCED from 4.0 to 2.0
                 if is_silence_frame:
                     silence_frames += 1
                 else:
@@ -487,8 +746,19 @@ class WebRTCManager:
                 expected_id = getattr(getattr(self, "session", None), "expected_user_utterance_id", None)
                 current_phase = getattr(getattr(self, "session", None), "phase", None)
 
-                if current_phase and current_phase != ConversationPhase.WAIT_FOR_USER:
-                    logger.info(f"🛑 Dropping buffered audio because phase is {current_phase}, not WAIT_FOR_USER")
+                # FIX: Check barge-in state FIRST before dropping utterances
+                # This allows interruptions during AI_SPEAKING phase
+                barge_in_decision = None
+                if self.barge_in_machine and hasattr(self.barge_in_machine, 'context'):
+                    barge_in_state = self.barge_in_machine.context.current_state
+                    # If barge-in detected sustained speech during AI_SPEAKING, treat as valid interruption
+                    if current_phase == ConversationPhase.AI_SPEAKING and barge_in_state == "BARGE_IN_CANDIDATE":
+                        logger.info(f"✅ BARGE-IN DETECTED - User spoke during AI response, will process interruption")
+                        barge_in_decision = "interrupt_ai"
+
+                # Only drop if NOT a valid interruption
+                if current_phase and current_phase != ConversationPhase.WAIT_FOR_USER and not barge_in_decision:
+                    logger.info(f"🛑 Dropping buffered audio because phase is {current_phase}, not WAIT_FOR_USER (and no barge-in)")
                     continue
 
                 if expected_id and expected_id == self._last_consumed_utterance_id:
@@ -502,11 +772,37 @@ class WebRTCManager:
                     continue
 
                 if len(audio_data) < MIN_BUFFER_BYTES:
-                    logger.info(
-                        f"⏳ Buffer too small at finalize ({len(audio_data)} bytes / "
-                        f"{len(audio_data) / (48000 * 2) * 1000:.0f}ms < {MIN_BUFFER_MS}ms); extending capture..."
-                    )
-                    continue
+                    # Check if this might be a stop-word BEFORE rejecting
+                    # Short utterances are often control commands!
+                    try:
+                        # Quick STT check on small buffer to detect stop-words
+                        quick_prep, quick_metrics = self._prepare_audio_for_stt(audio_data, effective_sample_rate)
+                        quick_transcript = await self.orchestrator.stt.transcribe(quick_prep)
+                        
+                        is_stop_word = any(
+                            keyword in quick_transcript.lower()
+                            for keyword in ["stop", "wait", "hold", "pause", "quit", "exit"]
+                        )
+                        
+                        if is_stop_word:
+                            logger.info(
+                                f"✅ [min-buffer-bypass] Small buffer ({len(audio_data)} bytes / "
+                                f"{len(audio_data) / (48000 * 2) * 1000:.0f}ms) BUT contains stop-word '{quick_transcript}' - processing"
+                            )
+                            # Allow processing to continue
+                        else:
+                            logger.info(
+                                f"⏳ Buffer too small at finalize ({len(audio_data)} bytes / "
+                                f"{len(audio_data) / (48000 * 2) * 1000:.0f}ms < {MIN_BUFFER_MS}ms); extending capture..."
+                            )
+                            continue
+                    except Exception:
+                        # If quick check fails, use original threshold logic
+                        logger.info(
+                            f"⏳ Buffer too small at finalize ({len(audio_data)} bytes / "
+                            f"{len(audio_data) / (48000 * 2) * 1000:.0f}ms < {MIN_BUFFER_MS}ms); extending capture..."
+                        )
+                        continue
 
                 if utterance_in_flight:
                     logger.warning(
@@ -561,27 +857,40 @@ class WebRTCManager:
                     except Exception:
                         pass
 
+                    # CRITICAL: Check for stop-words BEFORE applying quality filters
+                    # Stop-words can be ultra-short (<400ms) and still valid
+                    is_likely_stop_word = any(
+                        keyword in transcript.lower() 
+                        for keyword in ["stop", "wait", "hold", "pause", "quit", "exit"]
+                    )
+                    
                     if (
                         prep_metrics["duration_ms"] < STT_MIN_DURATION_MS
                         or prep_metrics["rms"] < STT_MIN_RMS
                         or prep_metrics["snr_db"] < STT_MIN_SNR_DB
                     ):
-                        logger.warning(
-                            "🛑 Prepared audio below floor (dur/rms/snr). Requesting repeat without STT call."
-                        )
-                        await self._notify(
-                            {
-                                "type": "transcript",
-                                "role": "assistant",
-                                "text": "I couldn't hear that clearly. Could you please repeat?",
-                                "turnId": self.session.last_ai_turn_id,
-                                "roomId": self.room_id,
-                                "timestamp": time.time(),
-                            }
-                        )
-                        utterance_in_flight = False
-                        await self.controller._set_waiting_for_user()
-                        continue
+                        # BYPASS quality filters if transcript contains stop-words
+                        if is_likely_stop_word:
+                            logger.info(
+                                f"✅ [stop-word-bypass] Audio below quality threshold BUT contains stop-word ('{transcript}'), processing anyway"
+                            )
+                        else:
+                            logger.warning(
+                                "🛑 Prepared audio below floor (dur/rms/snr). Requesting repeat without STT call."
+                            )
+                            await self._notify(
+                                {
+                                    "type": "transcript",
+                                    "role": "assistant",
+                                    "text": "I couldn't hear that clearly. Could you please repeat?",
+                                    "turnId": self.session.last_ai_turn_id,
+                                    "roomId": self.room_id,
+                                    "timestamp": time.time(),
+                                }
+                            )
+                            utterance_in_flight = False
+                            await self.controller._set_waiting_for_user()
+                            continue
 
                     transcript = await self.orchestrator.stt.transcribe(prepared_bytes)
                     logger.info(
@@ -601,6 +910,44 @@ class WebRTCManager:
                     logger.warning(f"⚠️ Empty transcript for utterance_id={current_utterance_id}, skipping")
                     continue
 
+                # Stop-word guard even when AI has finished speaking; prevents control phrases from hitting LLM
+                try:
+                    match = await self.stop_interruptor.check_for_stop_words(
+                        transcript=transcript,
+                        buffer_duration_ms=int(prep_metrics.get("duration_ms", 0)),
+                        stt_confidence=0.9,
+                        time_since_ai_start_ms=0,
+                        utterance_id=current_utterance_id,
+                    )
+                    logger.info(
+                        "🛑 [stop-final] Transcript check | text='%s' match=%s tier=%s",
+                        transcript[:80],
+                        match.matched,
+                        getattr(match, "tier", None),
+                    )
+                    if match.matched and match.tier == InterruptionTier.TIER_1_HARD:
+                        logger.info(
+                            f"🛑 TIER-1 STOP-WORD DETECTED: '{match.keyword}' | "
+                            f"This is a control command, NOT user speech - routing to USER_OVERRIDE"
+                        )
+                        await self._notify(
+                            {
+                                "type": "stop_word",
+                                "keyword": match.keyword or transcript,
+                                "utteranceId": current_utterance_id,
+                                "roomId": self.room_id,
+                                "timestamp": time.time(),
+                            }
+                        )
+                        if hasattr(self, "controller") and self.controller:
+                            await self.controller._notify_state(ConversationPhase.USER_OVERRIDE)
+                            await self.controller._set_waiting_for_user()
+                        # Skip normal processing to keep stop command out of LLM flow
+                        utterance_in_flight = False  # Reset flag before continue
+                        continue
+                except Exception as e:
+                    logger.warning(f"[stop-final] stop word detection failed: {e}")
+
                 await self._notify(
                     {
                         "type": "transcript",
@@ -611,15 +958,33 @@ class WebRTCManager:
                         "timestamp": time.time(),
                     }
                 )
+                
+                # Emit USER_SPEAKING_END after transcript is ready
+                await self._notify({
+                    'type': 'speaking_state',
+                    'speaker': 'user',
+                    'state': 'end',
+                    'utteranceId': current_utterance_id,
+                    'roomId': self.room_id,
+                    'timestamp': time.time(),
+                })
 
                 if hasattr(self, "controller") and self.controller:
                     logger.info(
                         f"🎮 Controller exists, calling handle_user_utterance with utterance_id={current_utterance_id}..."
                     )
                     try:
-                        async with self._utterance_processing_lock:
-                            await self.controller.handle_user_utterance(transcript, current_utterance_id)
-                            self._last_consumed_utterance_id = current_utterance_id
+                        # NEW: Check if this is a barge-in interruption
+                        if current_phase == ConversationPhase.AI_SPEAKING and barge_in_decision == "interrupt_ai":
+                            logger.info("🛑 INTERRUPTION ROUTE: User spoke during AI - canceling TTS immediately")
+                            await self.cancel_tts()
+                            # Route to interruption handler (will transition AI_SPEAKING → PROCESSING_USER)
+                            await self.controller.handle_interruption(transcript, current_utterance_id)
+                        else:
+                            # Normal route: User spoke during WAIT_FOR_USER
+                            async with self._utterance_processing_lock:
+                                await self.controller.handle_user_utterance(transcript, current_utterance_id)
+                                self._last_consumed_utterance_id = current_utterance_id
                         logger.info(f"✅ Controller processing completed for utterance_id={current_utterance_id}")
                     except Exception as e:
                         logger.error(
@@ -749,11 +1114,25 @@ class WebRTCManager:
         # FIRST: Set flag BEFORE pushing any audio to queue
         self.ai_is_speaking = True
         # Ignore barge-in during initial playback ramp
-        self._ai_playback_guard_deadline = time.time() + 0.6
+        self._ai_playback_guard_deadline = time.time() + 0.4
+        self._ai_playback_started_at = time.time()
         # Reset cancel flag
         self._tts_cancel_event.clear()
-        # Notify UI that playback is starting for this turn (if available)
+        # Reset barge-in machine to initial state (ready for detection)
+        if self.barge_in_machine:
+            self.barge_in_machine.reset()
+        self._stopword_buffer.clear()
+        # Notify UI that AI speaking is starting (explicit state event)
         try:
+            await self._notify({
+                'type': 'speaking_state',
+                'speaker': 'ai',
+                'state': 'start',
+                'turnId': turn_id,
+                'roomId': self.room_id,
+                'timestamp': time.time(),
+            })
+            # Also send legacy ai_playback for backward compatibility
             if turn_id:
                 await self._notify({
                     'type': 'ai_playback',
@@ -795,8 +1174,19 @@ class WebRTCManager:
             # ALWAYS re-enable VAD, even if there was an error
             self.ai_is_speaking = False
             logger.info(f"🎤 AI finished speaking - VAD will re-enable after grace period")
-            # Notify UI that playback ended for this turn
+            self._ai_playback_started_at = None
+            # Notify UI that AI speaking has ended (explicit state event)
             try:
+                await self._notify({
+                    'type': 'speaking_state',
+                    'speaker': 'ai',
+                    'state': 'end',
+                    'turnId': turn_id,
+                    'canceled': self._tts_cancel_event.is_set(),
+                    'roomId': self.room_id,
+                    'timestamp': time.time(),
+                })
+                # Also send legacy ai_playback for backward compatibility
                 if turn_id:
                     await self._notify({
                         'type': 'ai_playback',
@@ -958,6 +1348,16 @@ class WebRTCManager:
             "snr_db": snr_db,
             "peak": peak,
         }
+
+    def _boost_audio_for_stt(self, audio_bytes: bytes, gain: float = 2.0) -> bytes:
+        """Apply a simple gain to PCM audio for retrying STT on low-volume buffers."""
+        try:
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+            samples *= gain
+            np.clip(samples, -32767.0, 32767.0, out=samples)
+            return samples.astype(np.int16).tobytes()
+        except Exception:
+            return audio_bytes
 
     async def _notify(self, message: dict):
         """Send a UI event if a notify callback is available."""

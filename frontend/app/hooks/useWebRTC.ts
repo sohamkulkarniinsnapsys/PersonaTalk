@@ -20,6 +20,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
     const [isVideoOff, setIsVideoOff] = useState(false);
     const [persona, setPersona] = useState<PersonaInfo | null>(null);
     const [aiSpeaking, setAiSpeaking] = useState(false);
+    const [userSpeaking, setUserSpeaking] = useState(false); // NEW: Track user speaking from backend
     const [agentState, setAgentState] = useState<'INIT' | 'GREETING' | 'LISTENING' | 'USER_SPEAKING' | 'USER_FINISHED' | 'VALIDATING_UTTERANCE' | 'CLARIFICATION_REQUIRED' | 'THINKING' | 'AI_SPEAKING' | 'WAIT_FOR_USER' | 'PROCESSING_USER' | 'QUESTION' | 'EVALUATION' | 'RETRY' | 'EXPLANATION' | 'SUMMARY' | 'END' | undefined>(undefined);
     // Tracks which AI turns have started audio playback (signaled by backend)
     const [aiPlaybackStartedTurns, setAiPlaybackStartedTurns] = useState<Set<string>>(new Set());
@@ -248,7 +249,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                         timestamp: typeof data.timestamp === 'number' ? data.timestamp : Date.now() / 1000,
                         utteranceId: data.utteranceId as string | undefined,
                         turnId: data.turnId as string | undefined,
-                        isStreaming: Boolean(data.isPartial) || true, // Partial transcripts stream; final also stream briefly
+                        isStreaming: Boolean(data.isPartial), // Only mark streaming when partials are sent
                     };
                     
                     console.log(`📝 Transcript received: role="${role}", turnId="${item.turnId}", text="${item.text.substring(0, 50)}..."`);
@@ -304,6 +305,25 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                     console.log('🤖 Agent state:', s);
                     // @ts-ignore - we trust backend states
                     setAgentState(s);
+                } else if (data.type === 'speaking_state') {
+                    // NEW: Explicit speaking lifecycle events from backend
+                    const speaker = String(data.speaker || '');
+                    const state = String(data.state || '');
+                    console.log(`🔊 Speaking State: ${speaker} ${state}`);
+                    
+                    if (speaker === 'ai') {
+                        if (state === 'start') {
+                            setAiSpeaking(true);
+                        } else if (state === 'end') {
+                            setAiSpeaking(false);
+                        }
+                    } else if (speaker === 'user') {
+                        if (state === 'start') {
+                            setUserSpeaking(true);
+                        } else if (state === 'end') {
+                            setUserSpeaking(false);
+                        }
+                    }
                 }
             } catch (err) {
                 console.error('Error handling WS message:', err);
@@ -518,6 +538,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
         cleanup,
         persona,
         aiSpeaking,
+        userSpeaking, // NEW: Export user speaking state
         setAiSpeaking,
         transcript,
         aiPlaybackStartedTurns,

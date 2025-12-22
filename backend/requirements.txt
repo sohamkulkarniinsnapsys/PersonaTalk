@@ -11,3 +11,7 @@ wcwidth
 django-cors-headers
 jsonschema
 python-dotenv
+
+# Silero VAD for real-speech detection
+torch>=2.0.0
+torchaudio>=2.0.0

@@ -10,6 +10,7 @@ from .providers import get_providers
 from .utils import build_prompt
 from .tts_stream_track import TTSStreamTrack
 from ai_personas.tts_providers import ProviderFactory
+from .persona_context import get_persona_context_manager, PersonaContext
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,13 @@ class AIOrchestrator:
         # However, to keep existing signature if any, we just init providers lazily
         self._providers = None
         
-        # History storage
-        self.call_history = {} 
-        # Structured per-room memory
-        self.memory_by_room: dict[str, dict] = {}
+        # DEPRECATED: Use PersonaContextManager instead
+        # Legacy support for old code paths
+        self.call_history = {}  # For backward compatibility
+        self.memory_by_room: dict[str, dict] = {}  # For backward compatibility
+        
+        # Persona context manager (async-initialized)
+        self._context_manager = None
 
     @property
     def providers(self):
@@ -30,6 +34,12 @@ class AIOrchestrator:
             # Re-fetch providers from ai_agent.providers (correct module with STT_PROVIDER support)
             self._providers = get_providers()
         return self._providers
+    
+    async def get_context_manager(self):
+        """Get persona context manager instance (async-safe)."""
+        if self._context_manager is None:
+            self._context_manager = await get_persona_context_manager()
+        return self._context_manager
 
     @property
     def stt(self):
@@ -72,16 +82,11 @@ class AIOrchestrator:
             
         logger.info(f"STT: '{transcript}'")
 
-        # 2. History
-        if room_id not in self.call_history:
-            self.call_history[room_id] = []
-        history = self.call_history[room_id]
-        memory = self.memory_by_room.setdefault(room_id, {
-            'current_topic': None,
-            'last_intent': None,
-            'open_questions': [],
-            'confirmed_facts': [],
-        })
+        # 2. History - USE PERSONA CONTEXT for isolation
+        context_manager = await self.get_context_manager()
+        persona_ctx = await context_manager.get_context(persona_slug)
+        history = persona_ctx.get_room_history(room_id)
+        memory = persona_ctx.get_room_memory(room_id)
 
         # 3. Build Prompt
         # Include memory context as an extra system message to ground the LLM
@@ -118,11 +123,10 @@ class AIOrchestrator:
         should_tts = response_data.get("should_tts", True)
         logger.info(f"LLM: '{llm_text}'")
 
-        # Update History
-        history.append({"role": "user", "content": transcript})
-        history.append({"role": "assistant", "content": llm_text})
-        if len(history) > 20: 
-            self.call_history[room_id] = history[-20:]
+        # Update History - use PersonaContext.add_turn for isolation
+        persona_ctx.add_turn(room_id, "user", transcript)
+        persona_ctx.add_turn(room_id, "assistant", llm_text)
+        # PersonaContext automatically manages history size (40 turn limit)
 
         # Simple memory update: set topic if detectable from last turn
         try:
@@ -248,16 +252,8 @@ class AIOrchestrator:
         # Ask LLM to answer user_text in persona tone (text mode, no JSON)
         # System prompt already included in messages
         prompt = build_prompt(persona_config, history, user_text, mode="text")
-        # Inject memory context if available (history may not include it yet)
-        try:
-            # history items are not tied to a specific room here; safe to include generic memory marker
-            # Skip if no memory set in orchestrator for this flow
-            mem_ctx = getattr(self, 'memory_by_room', None)
-            if mem_ctx:
-                # In this text-only method we cannot know room_id; include a neutral instruction
-                prompt.insert(0, {'role': 'system', 'content': 'If the system provides context memory, align answers to current topic and confirmed facts.'})
-        except Exception:
-            pass
+        # Memory context is now managed per-persona via PersonaContext
+        # No need to inject generic memory instruction since history is already persona-isolated
         logger.info(f"   Built prompt with {len(prompt)} messages")
         try:
             logger.info(f"   Calling LLM.generate_response...")

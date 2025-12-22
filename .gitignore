@@ -62,3 +62,5 @@ Environment files
 test_audio_conditioning.py
 validate_production_fixes.py
 validate_vad_fix.py
+
+test_recordings

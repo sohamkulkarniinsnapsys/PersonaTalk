@@ -66,6 +66,7 @@ class ConversationPhase(str, enum.Enum):
     CLARIFICATION_REQUIRED = "CLARIFICATION_REQUIRED"
     THINKING = "THINKING"
     AI_SPEAKING = "AI_SPEAKING"
+    USER_OVERRIDE = "USER_OVERRIDE"
     WAIT_FOR_USER = "WAIT_FOR_USER"
     PROCESSING_USER = "PROCESSING_USER"
     QUESTION = "QUESTION"
@@ -188,8 +189,10 @@ class ConversationController:
             try:
                 await self._notify_state(ConversationPhase.AI_SPEAKING)
                 audio = await self.orchestrator.tts.synthesize(greeting, self.session.persona_config.get('voice', {}))
-                await self.send_audio(audio, self.session.last_ai_turn_id)
-                logger.info(f"✅ Greeting sent and played")
+                # CRITICAL FIX: Spawn audio playback as background task (non-blocking)
+                # This allows audio processing loop to continue and detect user input during speech
+                asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
+                logger.info(f"✅ Greeting queued for playback (non-blocking)")
             except Exception as e:
                 logger.error(f"❌ Greeting TTS failed: {e}", exc_info=True)
                 # If TTS fails, still progress to WAIT_FOR_USER so call doesn't block
@@ -263,9 +266,8 @@ class ConversationController:
                         self.session.persona_config.get('voice', {})
                     )
                     if audio_bytes:
-                        await self.send_audio(audio_bytes, self.session.last_ai_turn_id)
-                        # Brief pause to let audio play
-                        await asyncio.sleep(0.5)
+                        # CRITICAL FIX: Non-blocking background playback
+                        asyncio.ensure_future(self.send_audio(audio_bytes, self.session.last_ai_turn_id))
                 except Exception as e:
                     logger.error(f"❌ Failed to synthesize low-confidence clarification: {e}")
                 
@@ -290,8 +292,8 @@ class ConversationController:
                         self.session.persona_config.get('voice', {})
                     )
                     if audio_bytes:
-                        await self.send_audio(audio_bytes, self.session.last_ai_turn_id)
-                        await asyncio.sleep(0.3)
+                        # CRITICAL FIX: Non-blocking background playback
+                        asyncio.ensure_future(self.send_audio(audio_bytes, self.session.last_ai_turn_id))
                 except Exception as e:
                     logger.error(f"❌ Failed to synthesize clarification: {e}")
                 
@@ -375,8 +377,9 @@ class ConversationController:
             audio = await self.orchestrator.tts.synthesize(question, persona_cfg.get('voice', {}))
             logger.info(f"   ✅ TTS complete ({len(audio)} bytes), sending audio...")
             
-            # This call blocks until audio finishes playing
-            await self.send_audio(audio, self.session.last_ai_turn_id)
+            # CRITICAL FIX: Spawn audio playback as background task (non-blocking)
+            # Allows audio loop to continue and detect interruptions during speech
+            asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
             
             # Return to listening state
             await self._set_waiting_for_user()
@@ -389,7 +392,8 @@ class ConversationController:
                 fallback = "I'm listening. Please tell me more."
                 await self._notify_state(ConversationPhase.AI_SPEAKING)
                 audio = await self.orchestrator.tts.synthesize(fallback, persona_cfg.get('voice', {}))
-                await self.send_audio(audio, self.session.last_ai_turn_id)
+                # CRITICAL FIX: Non-blocking background playback
+                asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
             except Exception as e2:
                 logger.error(f"❌ Fallback TTS also failed: {e2}")
             # On any error, fallback to safe state
@@ -431,6 +435,47 @@ class ConversationController:
         except Exception as e:
             logger.debug(f"TTS warmup check failed: {e}; proceeding anyway")
 
+    async def handle_interruption(self, user_text: str, utterance_id: Optional[str] = None):
+        """Handle user interruption during AI speaking.
+        
+        This method is called when the user speaks during AI_SPEAKING phase.
+        It transitions immediately to PROCESSING_USER and processes the interrupt.
+        
+        CRITICAL: TTS is already canceled by webrtc.py before this is called.
+        """
+        logger.info(f"🛑 INTERRUPTION DETECTED: '{user_text}' (utterance_id={utterance_id})")
+        
+        async with self._lock:
+            # Transition directly to PROCESSING_USER (skip WAIT_FOR_USER)
+            old_phase = self.session.phase
+            self.session.phase = ConversationPhase.PROCESSING_USER
+            logger.info(f"🔄 Phase transition: {old_phase} → PROCESSING_USER (user interruption)")
+            
+            # Notify UI of phase change
+            await self._notify_state(ConversationPhase.PROCESSING_USER)
+            
+            # Add user turn to history
+            user_turn_id = self._next_user_turn_id()
+            self.session.last_user_turn_id = user_turn_id
+            self.session.add_user_turn(user_text, user_turn_id, utterance_id)
+            logger.info(f"   ✅ Added interruption to history (total turns: {len(self.session.history)})")
+            
+            # Notify UI of transcript
+            await self._notify_chat('user', user_text, turn_id=user_turn_id, utterance_id=utterance_id)
+            
+            # Process immediately based on flow mode
+            flow = self.session.persona_config.get('flow', 'interview')
+            
+            if flow == 'interview':
+                logger.info(f"   📋 Interview mode: generating contextual response to interruption")
+                # In interview mode, generate immediate response to the interruption
+                await self._evaluate_answer(user_text)
+            else:
+                logger.info(f"   💬 Question mode: generating answer to interruption")
+                await self._generate_and_speak_answer(user_text)
+            
+            logger.info(f"✅ Interruption handling complete for utterance_id={utterance_id}")
+
     async def _generate_and_speak_answer(self, user_text: str):
         logger.info(f"💬 _generate_and_speak_answer called with: '{user_text}'")
         try:
@@ -449,9 +494,10 @@ class ConversationController:
             logger.info(f"   🔊 Synthesizing complete answer as single audio stream...")
             await self._notify_state(ConversationPhase.AI_SPEAKING)
             audio = await self.orchestrator.tts.synthesize(answer, persona_cfg.get('voice', {}))
-            logger.info(f"   ✅ Synthesized {len(audio)} bytes, streaming to client...")
-            await self.send_audio(audio, self.session.last_ai_turn_id)
-            logger.info(f"   ✅ Audio playback complete, returning to WAIT_FOR_USER")
+            logger.info(f"   ✅ Synthesized {len(audio)} bytes, queuing for background playback...")
+            # CRITICAL FIX: Non-blocking background playback
+            asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
+            logger.info(f"   ✅ Audio queued, returning to WAIT_FOR_USER to accept user input during speech")
             await self._set_waiting_for_user()
         except Exception as e:
             logger.error(f"❌ Error in _generate_and_speak_answer: {e}", exc_info=True)
@@ -640,8 +686,10 @@ class ConversationController:
                     state['awaiting_answer'] = True  # Still waiting, but for retry
                     
                     hint_response = f"I'll share a quick hint: {result['hint']} Please try again."
-                    await self._speak_and_wait(hint_response, persona_cfg)
-                    return
+                    # CRITICAL FIX: Non-blocking playback - synthesize first, then queue
+                    hint_audio = await self.orchestrator.tts.synthesize(hint_response, persona_cfg.get('voice', {}))
+                    asyncio.ensure_future(self.send_audio(hint_audio, self.session.last_ai_turn_id))
+                    await self._set_waiting_for_user()
                     
                 else:
                     # Wrong or second incorrect attempt - share concept and move on
@@ -672,21 +720,29 @@ class ConversationController:
             logger.info("   🔊 Synthesizing interview question/feedback...")
             await self._notify_state(ConversationPhase.AI_SPEAKING)
             audio = await self.orchestrator.tts.synthesize(response, persona_cfg.get('voice', {}))
-            await self.send_audio(audio, self.session.last_ai_turn_id)
+            # CRITICAL FIX: Non-blocking background playback
+            asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
+            # Return immediately so audio loop can process user input during speech
             await self._set_waiting_for_user()
         except Exception as e:
             logger.error(f"❌ Error in interview flow: {e}", exc_info=True)
             await self._set_waiting_for_user()
 
     async def _speak_and_wait(self, text: str, persona_cfg: Dict[str, Any]):
-        """Utility to speak a prompt and return to WAIT_FOR_USER."""
+        """Utility to speak a prompt and return to WAIT_FOR_USER.
+        
+        CRITICAL FIX: This now uses NON-BLOCKING playback via asyncio.ensure_future
+        so the audio loop can continue processing user input during speech.
+        """
         ai_turn_id = self._next_ai_turn_id()
         self.session.last_ai_turn_id = ai_turn_id
         self.session.add_ai_turn(text, ai_turn_id)
         await self._notify_chat('assistant', text, turn_id=ai_turn_id)
         await self._notify_state(ConversationPhase.AI_SPEAKING)
         audio = await self.orchestrator.tts.synthesize(text, persona_cfg.get('voice', {}))
-        await self.send_audio(audio, self.session.last_ai_turn_id)
+        # CRITICAL FIX: Non-blocking background playback
+        asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
+        # Return immediately - audio continues in background
         await self._set_waiting_for_user()
 
     def _next_ai_turn_id(self) -> str:

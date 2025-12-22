@@ -4,7 +4,6 @@ import React, { useEffect, useRef, use, useState } from 'react';
 import { useWebRTC } from '@/app/hooks/useWebRTC';
 import { MediaControls } from '@/components/MediaControls';
 import { AIAnimation } from '@/components/AIAnimation';
-import { UserListening } from '@/components/UserListening';
 import { TranscriptPanel } from '@/components/TranscriptPanel';
 
 export default function CallRoom({ params }: { params: Promise<{ roomId: string }> }) {
@@ -21,6 +20,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
         cleanup,
         persona,
         aiSpeaking,
+        userSpeaking, // NEW: Get userSpeaking from backend events instead of audio analysis
         setAiSpeaking,
         transcript,
         aiPlaybackStartedTurns
@@ -28,7 +28,9 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
 
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteAudioRef = useRef<HTMLAudioElement>(null);
-    const [isUserSpeaking, setIsUserSpeaking] = useState(false);
+    
+    // Use backend-driven speaking state (userSpeaking from hook)
+    // No longer need local state or audio analysis
 
     // Cleanup on unmount or navigation
     useEffect(() => {
@@ -54,67 +56,11 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
         }
     }, [remoteStream]);
 
-    // Detect user speaking from local audio
-    useEffect(() => {
-        if (!localStream || isMuted) {
-            setIsUserSpeaking(false);
-            return;
-        }
-
-        const audioContext = new AudioContext();
-        const analyser = audioContext.createAnalyser();
-        const microphone = audioContext.createMediaStreamSource(localStream);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        
-        microphone.connect(analyser);
-        analyser.fftSize = 256;
-
-        const checkAudioLevel = () => {
-            analyser.getByteFrequencyData(dataArray);
-            const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-            setIsUserSpeaking(average > 30);
-            requestAnimationFrame(checkAudioLevel);
-        };
-
-        checkAudioLevel();
-
-        return () => {
-            microphone.disconnect();
-            analyser.disconnect();
-            audioContext.close();
-        };
-    }, [localStream, isMuted]);
-
-    // Detect AI speaking from remote audio
-    useEffect(() => {
-        if (!remoteStream) {
-            setAiSpeaking(false);
-            return;
-        }
-
-        const audioContext = new AudioContext();
-        const analyser = audioContext.createAnalyser();
-        const mediaSource = audioContext.createMediaStreamSource(remoteStream);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        
-        mediaSource.connect(analyser);
-        analyser.fftSize = 256;
-
-        const checkAudioLevel = () => {
-            analyser.getByteFrequencyData(dataArray);
-            const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-            setAiSpeaking(average > 30);
-            requestAnimationFrame(checkAudioLevel);
-        };
-
-        checkAudioLevel();
-
-        return () => {
-            mediaSource.disconnect();
-            analyser.disconnect();
-            audioContext.close();
-        };
-    }, [remoteStream, setAiSpeaking]);
+    // REMOVED: Local audio analysis for user speaking detection
+    // Now using backend VAD events (userSpeaking from useWebRTC hook)
+    
+    // REMOVED: Remote audio analysis for AI speaking detection  
+    // Now using backend TTS lifecycle events (aiSpeaking from useWebRTC hook)
 
     const showReconnect = ['failed', 'disconnected', 'closed'].includes(connectionStatus);
     const personaName = persona?.display_name || 'AI Persona';
@@ -125,7 +71,11 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
             {/* Background / AI Animation (Center) */}
             <div className="absolute inset-0 flex items-center justify-center z-0">
                 <div className="text-center">
-                    <AIAnimation isSpeaking={aiSpeaking} personaName={personaName} />
+                    <AIAnimation 
+                        isSpeaking={aiSpeaking} 
+                        userSpeaking={userSpeaking}
+                        personaName={personaName} 
+                    />
 
                     <p className="text-gray-400 mt-8 capitalize">Status: {connectionStatus}</p>
 
@@ -139,9 +89,6 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
                     )}
                 </div>
             </div>
-
-            {/* User Listening Animation */}
-            <UserListening isListening={isUserSpeaking} />
 
             {/* Hidden Remote Audio */}
             <audio ref={remoteAudioRef} autoPlay />
