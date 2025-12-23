@@ -54,7 +54,7 @@ function StreamingText({ text, isStreaming, role, shouldFreezeOnStop = false }: 
     // Use requestAnimationFrame for smooth 60fps animation
     // Add characters at ~50 chars/sec (20ms per char = ~100 chars visible per frame)
     // Slow down to roughly match spoken pace (~12-15 chars/sec)
-    const charDelay = 80; // milliseconds per character
+    const charDelay = 60; // milliseconds per character
     const timeout = setTimeout(() => {
       const newPos = displayedCursorPos + 1;
       setDisplayedCursorPos(newPos);
