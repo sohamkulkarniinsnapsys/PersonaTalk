@@ -23,7 +23,8 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
         userSpeaking, // NEW: Get userSpeaking from backend events instead of audio analysis
         setAiSpeaking,
         transcript,
-        aiPlaybackStartedTurns
+        aiPlaybackStartedTurns,
+        aiPlaybackCanceledTurns
     } = useWebRTC({ roomId });
 
     const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -127,6 +128,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
                     personaName={personaName}
                     aiSpeaking={aiSpeaking}
                     playbackStartedTurns={aiPlaybackStartedTurns}
+                    playbackCanceledTurns={aiPlaybackCanceledTurns}
                 />
             </div>
 

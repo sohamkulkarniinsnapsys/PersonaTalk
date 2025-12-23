@@ -24,6 +24,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
     const [agentState, setAgentState] = useState<'INIT' | 'GREETING' | 'LISTENING' | 'USER_SPEAKING' | 'USER_FINISHED' | 'VALIDATING_UTTERANCE' | 'CLARIFICATION_REQUIRED' | 'THINKING' | 'AI_SPEAKING' | 'WAIT_FOR_USER' | 'PROCESSING_USER' | 'QUESTION' | 'EVALUATION' | 'RETRY' | 'EXPLANATION' | 'SUMMARY' | 'END' | undefined>(undefined);
     // Tracks which AI turns have started audio playback (signaled by backend)
     const [aiPlaybackStartedTurns, setAiPlaybackStartedTurns] = useState<Set<string>>(new Set());
+    const [aiPlaybackCanceledTurns, setAiPlaybackCanceledTurns] = useState<Set<string>>(new Set());
     // Global dedupe for transcript messages
     const seenMessageKeysRef = useRef<Set<string>>(new Set());
     const [transcript, setTranscript] = useState<Array<{
@@ -214,8 +215,26 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                             const next = new Set(prev);
                             if (status === 'start') {
                                 next.add(tId);
+                                // If playback restarts, clear any canceled marker for this turn
+                                setAiPlaybackCanceledTurns(prevCanceled => {
+                                    const cleared = new Set(prevCanceled);
+                                    cleared.delete(tId);
+                                    return cleared;
+                                });
                             } else if (status === 'end') {
                                 next.delete(tId);
+                                setAiPlaybackCanceledTurns(prevCanceled => {
+                                    const cleared = new Set(prevCanceled);
+                                    cleared.delete(tId);
+                                    return cleared;
+                                });
+                            } else if (status === 'canceled') {
+                                next.delete(tId);
+                                setAiPlaybackCanceledTurns(prevCanceled => {
+                                    const updated = new Set(prevCanceled);
+                                    updated.add(tId);
+                                    return updated;
+                                });
                             }
                             return next;
                         });
@@ -316,6 +335,26 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                             setAiSpeaking(true);
                         } else if (state === 'end') {
                             setAiSpeaking(false);
+                            const tId = typeof data.turnId === 'string' ? data.turnId : undefined;
+                            const wasCanceled = Boolean(data.canceled);
+                            if (tId) {
+                                // Remove active streaming marker
+                                setAiPlaybackStartedTurns(prev => {
+                                    const next = new Set(prev);
+                                    next.delete(tId);
+                                    return next;
+                                });
+                                // Mark canceled turns so UI can freeze text where speech stopped
+                                setAiPlaybackCanceledTurns(prev => {
+                                    const next = new Set(prev);
+                                    if (wasCanceled) {
+                                        next.add(tId);
+                                    } else {
+                                        next.delete(tId);
+                                    }
+                                    return next;
+                                });
+                            }
                         }
                     } else if (speaker === 'user') {
                         if (state === 'start') {
@@ -542,6 +581,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
         setAiSpeaking,
         transcript,
         aiPlaybackStartedTurns,
+        aiPlaybackCanceledTurns,
         agentState,
         cancelTTS
     };

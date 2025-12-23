@@ -14,13 +14,14 @@ interface StreamingTextProps {
   text: string;
   isStreaming: boolean;
   role: 'user' | 'assistant';
+  shouldFreezeOnStop?: boolean; // When true, do not auto-reveal remaining text when streaming stops
 }
 
 /**
  * Streaming text component that animates character-by-character.
  * Creates real-time generation effect with smooth, performant animation.
  */
-function StreamingText({ text, isStreaming, role }: StreamingTextProps) {
+function StreamingText({ text, isStreaming, role, shouldFreezeOnStop = false }: StreamingTextProps) {
   const [displayedText, setDisplayedText] = useState('');
   const [displayedCursorPos, setDisplayedCursorPos] = useState(0);
   const textLengthRef = useRef(text.length);
@@ -30,8 +31,14 @@ function StreamingText({ text, isStreaming, role }: StreamingTextProps) {
   }, [text]);
 
   useEffect(() => {
-    // If not streaming, show everything immediately
+    // If not streaming, decide whether to reveal or freeze at current cursor
     if (!isStreaming) {
+      if (shouldFreezeOnStop) {
+        const currentPos = Math.min(displayedCursorPos, text.length);
+        setDisplayedCursorPos(currentPos);
+        setDisplayedText(text.slice(0, currentPos));
+        return;
+      }
       setDisplayedText(text);
       setDisplayedCursorPos(text.length);
       return;
@@ -60,8 +67,14 @@ function StreamingText({ text, isStreaming, role }: StreamingTextProps) {
   // When text content changes (new message or update), sync displayed text
   useEffect(() => {
     if (!isStreaming) {
-      setDisplayedText(text);
-      setDisplayedCursorPos(text.length);
+      if (shouldFreezeOnStop) {
+        const currentPos = Math.min(displayedCursorPos, text.length);
+        setDisplayedText(text.slice(0, currentPos));
+        setDisplayedCursorPos(currentPos);
+      } else {
+        setDisplayedText(text);
+        setDisplayedCursorPos(text.length);
+      }
     } else {
       // If message is new and streaming, start from beginning
       // This handles case where new messages arrive
@@ -87,13 +100,14 @@ interface MessageItemProps {
   isVisible: boolean;
   personaName?: string;
   playbackStartedTurns?: Set<string>;
+  playbackCanceledTurns?: Set<string>;
 }
 
 /**
  * Individual message with delayed display capability.
  * Used to sync assistant messages with audio playback.
  */
-function MessageItem({ item, isVisible, personaName, playbackStartedTurns }: MessageItemProps) {
+function MessageItem({ item, isVisible, personaName, playbackStartedTurns, playbackCanceledTurns }: MessageItemProps) {
   if (!isVisible) {
     return null; // Hidden until delay expires
   }
@@ -101,6 +115,10 @@ function MessageItem({ item, isVisible, personaName, playbackStartedTurns }: Mes
   // Stream assistant text only while its turn is actively playing audio
   const isStreamingActive = item.role === 'assistant'
     ? Boolean(item.turnId && playbackStartedTurns?.has(item.turnId))
+    : false;
+
+  const isCanceled = item.role === 'assistant'
+    ? Boolean(item.turnId && playbackCanceledTurns?.has(item.turnId))
     : false;
 
   return (
@@ -121,6 +139,7 @@ function MessageItem({ item, isVisible, personaName, playbackStartedTurns }: Mes
           text={item.text}
           isStreaming={isStreamingActive || item.isStreaming || false}
           role={item.role}
+          shouldFreezeOnStop={isCanceled}
         />
       </div>
     </div>
@@ -131,12 +150,14 @@ export function TranscriptPanel({
   items, 
   personaName,
   aiSpeaking = false,
-  playbackStartedTurns
+  playbackStartedTurns,
+  playbackCanceledTurns
 }: { 
   items: TranscriptItem[]; 
   personaName?: string;
   aiSpeaking?: boolean;
   playbackStartedTurns?: Set<string>;
+  playbackCanceledTurns?: Set<string>;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -242,6 +263,7 @@ export function TranscriptPanel({
               isVisible={visibleItems.has(idx)}
               personaName={personaName}
               playbackStartedTurns={playbackStartedTurns}
+              playbackCanceledTurns={playbackCanceledTurns}
             />
           ))
         )}
