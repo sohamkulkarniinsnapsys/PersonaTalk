@@ -921,6 +921,10 @@ class WebRTCManager:
                     except Exception:
                         pass
 
+                    # Call STT provider
+                    transcript = await self.orchestrator.stt.transcribe(prepared_bytes)
+                    logger.info(f"✅ STT returned ({len(transcript)} chars, utterance_id={current_utterance_id}): '{transcript}'")
+
                     # CRITICAL: Check for stop-words BEFORE applying quality filters
                     # Stop-words can be ultra-short (<400ms) and still valid
                     is_likely_stop_word = any(

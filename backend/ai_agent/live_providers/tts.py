@@ -112,6 +112,60 @@ class SarvamTTS:
         logger.info(f"   Supported languages: {', '.join(self.SUPPORTED_LANGUAGES.values())}")
         logger.info(f"   Available voices: {', '.join(self.AVAILABLE_VOICES.keys())}")
     
+    def _chunk_text(self, text: str, max_chars: int = 480) -> list[str]:
+        """
+        Split text into chunks ≤ max_chars, preferring sentence boundaries.
+        Sarvam API has a 500-char limit per request.
+        """
+        import re
+        
+        # If short enough, return as-is
+        if len(text) <= max_chars:
+            return [text]
+        
+        # Split on sentence boundaries (., !, ?, or code block boundaries)
+        sentence_pattern = r'(?<=[.!?])\s+|(?<=```)\n|(?<=```)\s'
+        sentences = re.split(sentence_pattern, text)
+        
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # If single sentence exceeds limit, force-split on spaces
+            if len(sentence) > max_chars:
+                words = sentence.split()
+                temp_chunk = ""
+                for word in words:
+                    if len(temp_chunk) + len(word) + 1 <= max_chars:
+                        temp_chunk += (" " if temp_chunk else "") + word
+                    else:
+                        if temp_chunk:
+                            chunks.append(temp_chunk)
+                        temp_chunk = word
+                if temp_chunk:
+                    chunks.append(temp_chunk)
+                continue
+            
+            # Try to add sentence to current chunk
+            test_chunk = (current_chunk + " " + sentence) if current_chunk else sentence
+            if len(test_chunk) <= max_chars:
+                current_chunk = test_chunk
+            else:
+                # Flush current chunk and start new one
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = sentence
+        
+        # Flush remaining
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks if chunks else [text[:max_chars]]
+    
     def _get_voice_and_language(self, voice_config: Dict[str, Any]) -> tuple[str, str]:
         """
         Determine voice and language from voice_config.
@@ -196,123 +250,164 @@ class SarvamTTS:
             
             synthesis_start = time.time()
             
-            # Prepare request payload
-            payload = {
-                "inputs": [text],
-                "target_language_code": language,
-                "speaker": voice,
-                "pitch": pitch,
-                "pace": speed,  # Sarvam uses 'pace' for speed control
-                "loudness": 1.0,  # Default loudness
-            }
+            # Chunk text if needed (Sarvam limit: 500 chars)
+            chunks = self._chunk_text(text, max_chars=480)
+            if len(chunks) > 1:
+                logger.info(f"   📦 Split into {len(chunks)} chunks due to 500-char API limit")
             
-            # Add unique request ID for tracking
-            request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-            logger.info(f"   Request ID: {request_id}")
+            # Synthesize each chunk and concatenate audio
+            all_audio_bytes = []
             
-            request_headers = {
-                'X-Request-ID': request_id,
-                'Content-Type': 'application/json',
-            }
-            
-            # Call Sarvam TTS API
-            retry_count = 0
-            max_retries = 2
-            backoff_delay = 0.5
-            
-            while retry_count <= max_retries:
-                try:
-                    logger.info(f"🛰️  SarvamTTS POST {self.api_url}")
-                    
-                    resp = await asyncio.to_thread(
-                        self.session.post,
-                        self.api_url,
-                        json=payload,
-                        headers=request_headers,
-                        timeout=30,
-                    )
-                    
-                    logger.info(
-                        "🛰️  SarvamTTS API response | status=%s | content_length=%s",
-                        resp.status_code,
-                        resp.headers.get('content-length', 'unknown'),
-                    )
-                    
-                    if resp.ok:
-                        break
-                    elif retry_count < max_retries:
-                        logger.warning(f"⚠️  HTTP {resp.status_code}, retrying in {backoff_delay}s...")
-                        await asyncio.sleep(backoff_delay)
-                        backoff_delay *= 2
-                        retry_count += 1
-                    else:
-                        body_preview = resp.text[:500] if resp.text else "<no body>"
-                        logger.error(f"❌ SarvamTTS API HTTP {resp.status_code}: {body_preview}")
-                        resp.raise_for_status()
+            for i, chunk in enumerate(chunks):
+                logger.info(f"   🔊 Synthesizing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
                 
-                except Exception as e:
-                    if retry_count < max_retries:
-                        logger.warning(f"⚠️  Connection failed: {e}, retrying in {backoff_delay}s...")
-                        await asyncio.sleep(backoff_delay)
-                        backoff_delay *= 2
-                        retry_count += 1
-                    else:
-                        raise
+                # Prepare request payload
+                payload = {
+                    "inputs": [chunk],
+                    "target_language_code": language,
+                    "speaker": voice,
+                    "pitch": pitch,
+                    "pace": speed,  # Sarvam uses 'pace' for speed control
+                    "loudness": 1.0,  # Default loudness
+                }
             
-            # Parse response - Sarvam returns audio bytes directly or in a JSON response
-            audio_bytes = None
-            
-            # Check if response is binary audio or JSON
-            content_type = (resp.headers.get('content-type') or '').lower()
-            logger.info(f"   Content-Type: '{content_type}'")
-            
-            if ('audio' in content_type) or ('wav' in content_type) or ('mpeg' in content_type) or ('octet-stream' in content_type):
-                # Direct audio bytes
-                audio_bytes = resp.content
-                logger.info(f"✅ Received direct audio: {len(audio_bytes)} bytes")
-            elif 'json' in content_type or content_type == '':
-                # JSON response containing audio
-                try:
-                    result = resp.json()
-                except json.JSONDecodeError:
-                    logger.error("❌ Invalid JSON in response")
-                    raise
-
-                # Attempt robust extraction of audio from JSON
-                audio_bytes = self._extract_audio_from_json(result)
-
-                # Check for error in response
-                if not audio_bytes and isinstance(result, dict) and 'error' in result:
-                    logger.error(f"❌ SarvamTTS API error: {result['error']}")
-                    raise RuntimeError(f"TTS error: {result['error']}")
-
-                if not audio_bytes:
-                    # Log available keys for diagnostics
-                    keys_preview = []
+                # Add unique request ID for tracking
+                request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                
+                request_headers = {
+                    'X-Request-ID': request_id,
+                    'Content-Type': 'application/json',
+                }
+                
+                # Call Sarvam TTS API with retry logic
+                retry_count = 0
+                max_retries = 2
+                backoff_delay = 0.5
+                
+                while retry_count <= max_retries:
                     try:
-                        if isinstance(result, dict):
-                            keys_preview = list(result.keys())[:10]
-                    except Exception:
-                        pass
-                    logger.error(f"❌ No audio found in JSON response. Keys: {keys_preview}")
-                    raise RuntimeError("TTS JSON response did not contain audio")
+                        logger.info(f"🛰️  SarvamTTS POST {self.api_url} (chunk {i+1})")
+                        
+                        resp = await asyncio.to_thread(
+                            self.session.post,
+                            self.api_url,
+                            json=payload,
+                            headers=request_headers,
+                            timeout=30,
+                        )
+                        
+                        logger.info(
+                            "🛰️  SarvamTTS API response | status=%s | content_length=%s",
+                            resp.status_code,
+                            resp.headers.get('content-length', 'unknown'),
+                        )
+                        
+                        if resp.ok:
+                            break
+                        elif retry_count < max_retries:
+                            logger.warning(f"⚠️  HTTP {resp.status_code}, retrying in {backoff_delay}s...")
+                            await asyncio.sleep(backoff_delay)
+                            backoff_delay *= 2
+                            retry_count += 1
+                        else:
+                            body_preview = resp.text[:500] if resp.text else "<no body>"
+                            logger.error(f"❌ SarvamTTS API HTTP {resp.status_code}: {body_preview}")
+                            resp.raise_for_status()
+                    
+                    except Exception as e:
+                        if retry_count < max_retries:
+                            logger.warning(f"⚠️  Connection failed: {e}, retrying in {backoff_delay}s...")
+                            await asyncio.sleep(backoff_delay)
+                            backoff_delay *= 2
+                            retry_count += 1
+                        else:
+                            raise
+                
+                # Parse response - Sarvam returns audio bytes directly or in a JSON response
+                audio_bytes = None
+                
+                # Check if response is binary audio or JSON
+                content_type = (resp.headers.get('content-type') or '').lower()
+                logger.info(f"   Content-Type: '{content_type}'")
+                
+                if ('audio' in content_type) or ('wav' in content_type) or ('mpeg' in content_type) or ('octet-stream' in content_type):
+                    # Direct audio bytes
+                    audio_bytes = resp.content
+                    logger.info(f"✅ Received direct audio: {len(audio_bytes)} bytes")
+                elif 'json' in content_type or content_type == '':
+                    # JSON response containing audio
+                    try:
+                        result = resp.json()
+                    except json.JSONDecodeError:
+                        logger.error("❌ Invalid JSON in response")
+                        raise
+
+                    # Attempt robust extraction of audio from JSON
+                    audio_bytes = self._extract_audio_from_json(result)
+
+                    # Check for error in response
+                    if not audio_bytes and isinstance(result, dict) and 'error' in result:
+                        logger.error(f"❌ SarvamTTS API error: {result['error']}")
+                        raise RuntimeError(f"TTS error: {result['error']}")
+
+                    if not audio_bytes:
+                        # Log available keys for diagnostics
+                        keys_preview = []
+                        try:
+                            if isinstance(result, dict):
+                                keys_preview = list(result.keys())[:10]
+                        except Exception:
+                            pass
+                        logger.error(f"❌ No audio found in JSON response. Keys: {keys_preview}")
+                        raise RuntimeError("TTS JSON response did not contain audio")
+                else:
+                    # Unknown/unsupported content type; do not assume binary audio
+                    logger.error(f"❌ Unsupported content type '{content_type}' for TTS response")
+                    raise RuntimeError(f"Unsupported content type: {content_type}")
+                
+                if not audio_bytes or len(audio_bytes) == 0:
+                    logger.error(f"❌ Chunk {i+1} synthesis failed: no audio received")
+                    raise RuntimeError(f"TTS synthesis returned empty audio for chunk {i+1}")
+                
+                # Ensure audio is in correct format (WAV, 48kHz mono 16-bit)
+                audio_bytes = self._ensure_48k_mono_wav(audio_bytes)
+                all_audio_bytes.append(audio_bytes)
+                logger.info(f"   ✅ Chunk {i+1} synthesized: {len(audio_bytes)} bytes")
+            
+            # Concatenate all chunks (strip WAV headers, keep only PCM data)
+            if len(all_audio_bytes) == 1:
+                final_audio = all_audio_bytes[0]
+                logger.info(f"   ✅ Single chunk: {len(final_audio)} bytes (no concatenation needed)")
             else:
-                # Unknown/unsupported content type; do not assume binary audio
-                logger.error(f"❌ Unsupported content type '{content_type}' for TTS response")
-                raise RuntimeError(f"Unsupported content type: {content_type}")
-            
-            if not audio_bytes or len(audio_bytes) == 0:
-                logger.error("❌ Synthesis failed: no audio received")
-                raise RuntimeError("TTS synthesis returned empty audio")
-            
-            # Ensure audio is in correct format (WAV, 48kHz mono 16-bit)
-            # Sarvam API should return 48kHz WAV, but verify
-            audio_bytes = self._ensure_48k_mono_wav(audio_bytes)
+                # Extract PCM from each WAV, concatenate, then re-wrap
+                pcm_chunks = []
+                for wav_bytes in all_audio_bytes:
+                    # WAV header is 44 bytes, rest is PCM
+                    if len(wav_bytes) > 44 and wav_bytes[:4] == b'RIFF':
+                        pcm_chunks.append(wav_bytes[44:])
+                    else:
+                        pcm_chunks.append(wav_bytes)  # Assume raw PCM
+                
+                # Concatenate PCM
+                combined_pcm = b''.join(pcm_chunks)
+                
+                # Re-wrap in WAV header
+                import io
+                import wave
+                with io.BytesIO() as wav_buffer:
+                    with wave.open(wav_buffer, 'wb') as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(48000)
+                        wav_file.writeframes(combined_pcm)
+                    final_audio = wav_buffer.getvalue()
+                
+                logger.info(f"   🔗 Concatenated {len(all_audio_bytes)} chunks ({sum(len(p) for p in pcm_chunks)} PCM bytes) into {len(final_audio)} bytes")
             
             synthesis_time = time.time() - synthesis_start
-            logger.info(f"✅ TTS synthesis complete: {synthesis_time:.2f}s total, {len(audio_bytes)} bytes")
+            logger.info(f"✅ TTS synthesis complete: {synthesis_time:.2f}s total, {len(final_audio)} bytes")
             
-            return audio_bytes
+            return final_audio
         
         except requests.exceptions.RequestException as e:
             body_preview = ""

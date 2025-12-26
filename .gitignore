@@ -51,16 +51,11 @@ yarn-error.log*
 !.yarn/releases
 !.yarn/versions
 
-# --------------------
-Environment files
-# --------------------
+# env
 *.env
 *.env.local
 
 *.md
-
-test_audio_conditioning.py
-validate_production_fixes.py
-validate_vad_fix.py
+*.txt
 
 test_recordings

@@ -487,14 +487,35 @@ class ConversationController:
             self.session.last_ai_turn_id = ai_turn_id
             self.session.add_ai_turn(answer, ai_turn_id)
             await self._notify_chat('assistant', answer, turn_id=ai_turn_id)
+            
+            # Strip code blocks for TTS (voice) while keeping full text in chat transcript
+            tts_text = self._strip_code_blocks_for_speech(answer)
+            
             # FIXED: Synthesize FULL answer as ONE continuous audio (not sentence-by-sentence)
             # Previous behavior: split into sentences, synthesize each, stream with pauses
             # Problem: Unnatural pauses between sentences ("Got it." [pause] "Could you tell me...")
             # Solution: Feed entire answer to TTS, let Coqui handle pacing naturally
             logger.info(f"   🔊 Synthesizing complete answer as single audio stream...")
             await self._notify_state(ConversationPhase.AI_SPEAKING)
-            audio = await self.orchestrator.tts.synthesize(answer, persona_cfg.get('voice', {}))
-            logger.info(f"   ✅ Synthesized {len(audio)} bytes, queuing for background playback...")
+            
+            try:
+                audio = await self.orchestrator.tts.synthesize(tts_text, persona_cfg.get('voice', {}))
+                logger.info(f"   ✅ Synthesized {len(audio)} bytes, queuing for background playback...")
+            except Exception as tts_error:
+                # Fallback: Synthesize short error message so AI doesn't go silent
+                logger.error(f"❌ TTS synthesis failed: {tts_error}")
+                logger.info(f"   🔄 Synthesizing fallback message instead...")
+                fallback_text = "Here is your answer."
+                try:
+                    audio = await self.orchestrator.tts.synthesize(fallback_text, persona_cfg.get('voice', {}))
+                    logger.info(f"   ✅ Fallback synthesized: {len(audio)} bytes")
+                except Exception as fallback_error:
+                    logger.error(f"❌ Fallback TTS also failed: {fallback_error}")
+                    # Give up on TTS, but notify user via transcript
+                    await self._notify_chat('assistant', "[Audio synthesis failed. Please check logs.]", turn_id=ai_turn_id)
+                    await self._set_waiting_for_user()
+                    return
+            
             # CRITICAL FIX: Non-blocking background playback
             asyncio.ensure_future(self.send_audio(audio, self.session.last_ai_turn_id))
             logger.info(f"   ✅ Audio queued, returning to WAIT_FOR_USER to accept user input during speech")
@@ -796,28 +817,63 @@ class ConversationController:
             if self.session.phase != ConversationPhase.GREETING:
                 logger.info(f"   ⏭️  Skipping trivial single-word utterance: '{s}'")
                 return False
-
-        # Low-confidence STT fallback phrases should not advance the flow
-        low_confidence_markers = {
-            "i didn't catch that, could you please repeat?",
-            "could you please repeat",
-            "please repeat that",
-        }
-        if any(marker in s.lower() for marker in low_confidence_markers):
-            logger.info("   ⏭️  Skipping low-confidence STT fallback; asking user to repeat")
-            return False
         
-        # Check for duplicate of last user turn (prevents processing same input twice)
-        for item in reversed(self.session.history):
-            if item.get('role') == 'user':
-                last_user = item.get('content', '').strip().lower()
-                if last_user and last_user == s.lower():
-                    logger.info(f"   ⏭️  Skipping duplicate user turn: '{s}'")
-                    return False
-                # Only check the last user turn, then break
-                break
-        
+        # If we passed all rejection checks, the utterance is meaningful
         return True
+
+    def _strip_code_blocks_for_speech(self, text: str) -> str:
+        """Remove code blocks from text for TTS while keeping explanatory paragraphs.
+        
+        Replaces:
+        - Fenced code blocks (```language...```) with "See the code below."
+        - Indented code blocks (multiple lines starting with spaces/braces)
+        - Inline code (`code`) is kept as-is (short identifiers are okay to speak)
+        
+        This prevents the AI from reading out entire code listings verbatim,
+        which is not useful in voice conversations.
+        
+        Args:
+            text: Original text with potential code blocks
+            
+        Returns:
+            Text with code blocks replaced by short placeholder
+        """
+        import re
+        
+        original_text = text
+        blocks_stripped = 0
+        
+        # Pattern 1: Fenced code blocks (```language\n...code...\n```)
+        fenced_pattern = r'```[\w]*\n.*?\n```'
+        fenced_matches = len(re.findall(fenced_pattern, text, re.DOTALL))
+        if fenced_matches > 0:
+            text = re.sub(fenced_pattern, ' See the code below. ', text, flags=re.DOTALL)
+            blocks_stripped += fenced_matches
+        
+        # Pattern 2: Code blocks starting with common keywords (class, function, const, etc.)
+        # Matches from keyword to next paragraph (double newline) or next capital letter sentence
+        code_keyword_pattern = r'\n(class|function|const|let|var|def|async|import|export)\s+\w+[\s\S]*?(?=\n\n[A-Z]|\Z)'
+        keyword_matches = len(re.findall(code_keyword_pattern, text))
+        if keyword_matches > 0:
+            text = re.sub(code_keyword_pattern, '\n\nSee the code below.\n\n', text)
+            blocks_stripped += keyword_matches
+        
+        # Pattern 3: Multi-line blocks with braces and semicolons (typical code structure)
+        # Matches blocks that have { } and semicolons across multiple lines
+        brace_block_pattern = r'\{[^}]{30,}\}'  # At least 30 chars between braces
+        brace_matches = len(re.findall(brace_block_pattern, text, re.DOTALL))
+        if brace_matches >= 2:  # At least 2 code blocks
+            text = re.sub(brace_block_pattern, ' (code shown below) ', text, flags=re.DOTALL)
+            blocks_stripped += brace_matches
+        
+        if blocks_stripped > 0:
+            logger.info(f"   🔇 Stripped {blocks_stripped} code block(s) for TTS")
+            logger.info(f"   📏 Text length: {len(original_text)} → {len(text)} chars")
+            return text
+        
+        # No code blocks found
+        logger.info(f"   ℹ️  No code blocks detected for stripping")
+        return text
 
     async def _notify_chat(self, role: str, text: str, turn_id: Optional[str] = None, utterance_id: Optional[str] = None):
         """Emit a chat/transcript event to UI if a notifier is configured."""
