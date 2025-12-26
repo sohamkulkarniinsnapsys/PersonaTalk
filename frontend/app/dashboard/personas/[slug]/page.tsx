@@ -7,14 +7,6 @@ import { getCSRFToken } from '@/app/lib/auth'
 
 // --- Constants & Types ---
 
-const VOICE_STYLES = [
-  { id: "conversational", label: "Conversational (Natural)" },
-  { id: "calm", label: "Calm & Gentle" },
-  { id: "professional", label: "Professional" },
-  { id: "expressive", label: "Expressive / Lively" },
-  { id: "narrative", label: "Narrative / Storytelling" }
-]
-
 const PRESETS = [
     {
         id: "helpful-assistant",
@@ -42,23 +34,22 @@ const PRESETS = [
     }
 ]
 
+// Sarvam AI Voices (fixed list)
 const VOICE_PRESETS = [
-    { id: "p225", label: "Female (Soft)", gender: "Female" },
-    { id: "p226", label: "Male (Deep)", gender: "Male" },
-    { id: "p228", label: "Male (Crisp)", gender: "Female" },
-    { id: "p232", label: "Male (Assertive)", gender: "Male" },
-    { id: "p236", label: "Male (Warm)", gender: "Female" },
-    { id: "p254", label: "Male (Narrator)", gender: "Male" },
-    { id: "p266", label: "Male (Expressive)", gender: "Male" },
-    { id: "p237", label: "Female (Energetic)", gender: "Male" },
-    { id: "p243", label: "Female (Calm)", gender: "Male" },
-    { id: "p244", label: "Female (Professional)", gender: "Female" },
+    { id: "anushka", label: "Anushka (Female)", gender: "Female", description: "Clear Indian English female voice" },
+    { id: "manisha", label: "Manisha (Female)", gender: "Female", description: "Warm Indian English female voice" },
+    { id: "vidya", label: "Vidya (Female)", gender: "Female", description: "Balanced Indian English female voice" },
+    { id: "arya", label: "Arya (Female)", gender: "Female", description: "Neutral Indian English female voice" },
+    { id: "abhilash", label: "Abhilash (Male)", gender: "Male", description: "Clear Indian English male voice" },
+    { id: "karun", label: "Karun (Male)", gender: "Male", description: "Warm Indian English male voice" },
+    { id: "hitesh", label: "Hitesh (Male)", gender: "Male", description: "Neutral Indian English male voice" },
 ]
 
 type VoiceConfig = {
     provider: string
-    preset_id: string
+    preset_id: string | null
     voice_id?: string | null
+    language_code?: string | null
     speed: number
     pitch: number
     override?: boolean
@@ -99,7 +90,7 @@ const DEFAULT_CONFIG: PersonaConfig = {
     system_prompt: "",
     examples: [],
     behavior: { max_speech_time_s: 45, verbosity: "default", follow_up_questions: false },
-    voice: { provider: "coqui", preset_id: "p225", voice_id: "p225", speed: 0.95, pitch: -1.0, style: "conversational", override: false },
+    voice: { provider: "sarvam", preset_id: "anushka", voice_id: "anushka", language_code: "en-IN", speed: 1.0, pitch: 0.0, style: "conversational", override: false },
     moderation: { enabled: true, level: "moderate" },
     should_tts: true,
     metadata: { source_template_id: null }
@@ -359,16 +350,31 @@ export default function PersonaEditor() {
         setPreviewingVoice(true)
 
         try {
+            // Add timeout controller (3 minutes max for XTTS v2 first synthesis)
+            const controller = new AbortController()
+            const timeoutId = setTimeout(() => controller.abort(), 180000) // 3 min timeout
+
             const res = await fetch(`http://localhost:8000/api/personas/${slugParam}/preview/`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     text: "Hello there. This is how I sound in a real conversation. Let me know if this feels natural to you.",
                     voice_config: formState.config.voice
-                })
+                }),
+                signal: controller.signal
             })
 
-            if (!res.ok) throw new Error("Preview failed")
+            clearTimeout(timeoutId)
+
+            if (res.status === 429) {
+                const data = await res.json()
+                throw new Error(data.error || "Synthesis in progress. Please wait and try again.")
+            }
+
+            if (!res.ok) {
+                const errorData = await res.json().catch(() => ({}))
+                throw new Error(errorData.error || "Preview failed. Check backend logs for details.")
+            }
 
             const blob = await res.blob()
             const url = URL.createObjectURL(blob)
@@ -377,7 +383,11 @@ export default function PersonaEditor() {
                 previewAudioRef.current.play()
             }
         } catch (e: any) {
-            alert(e.message)
+            if (e.name === 'AbortError') {
+                alert("Preview timed out after 3 minutes. The system may be overloaded. Try restarting the backend or switching to CPU mode.")
+            } else {
+                alert(`Preview failed: ${e.message}`)
+            }
         } finally {
             setPreviewingVoice(false)
         }
@@ -498,49 +508,49 @@ export default function PersonaEditor() {
 
                         <div className="space-y-4">
                             <div>
-                                <label className="block text-sm font-medium mb-1">Preset Voice</label>
+                                <label className="block text-sm font-medium mb-1">Voice Preset</label>
                                 <select
                                     className="w-full p-2 border rounded dark:bg-gray-900 dark:border-gray-700 dark:text-white"
-                                    value={formState.config.voice.preset_id}
-                                    onChange={e => updateVoice({ preset_id: e.target.value, voice_id: e.target.value })}
+                                    value={formState.config.voice.preset_id || 'anushka'}
+                                    onChange={e => {
+                                        const preset = VOICE_PRESETS.find(v => v.id === e.target.value);
+                                        updateVoice({ 
+                                            preset_id: preset?.id || null,
+                                            voice_id: preset?.id || null
+                                        });
+                                    }}
                                 >
                                     {VOICE_PRESETS.map(v => (
                                         <option key={v.id} value={v.id}>{v.label}</option>
                                     ))}
                                 </select>
-                            </div>
-                            
-                            <div>
-                                <label className="block text-sm font-medium mb-1">Speaking Style</label>
-                                <select
-                                    className="w-full p-2 border rounded dark:bg-gray-900 dark:border-gray-700 dark:text-white"
-                                    value={formState.config.voice.style || "conversational"}
-                                    onChange={e => updateVoice({ style: e.target.value })}
-                                >
-                                    {VOICE_STYLES.map(s => (
-                                    <option key={s.id} value={s.id}>{s.label}</option>
-                                    ))}
-                                </select>
+                                {VOICE_PRESETS.find(v => v.id === (formState.config.voice.preset_id || 'anushka'))?.description && (
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 italic">
+                                        {VOICE_PRESETS.find(v => v.id === (formState.config.voice.preset_id || 'anushka'))?.description}
+                                    </p>
+                                )}
                             </div>
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs text-gray-500 mb-1">Speed: {formState.config.voice.speed}x</label>
+                                    <label className="block text-xs text-gray-500 mb-1">Speed: {formState.config.voice.speed?.toFixed(1)}x</label>
                                     <input
                                         type="range" min="0.5" max="2.0" step="0.1"
                                         className="w-full accent-blue-600"
                                         value={formState.config.voice.speed}
                                         onChange={e => updateVoice({ speed: parseFloat(e.target.value) })}
                                     />
+                                    <p className="text-xs text-gray-400 mt-1">supports 0.5x-2.0x pace</p>
                                 </div>
                                 <div>
-                                    <label className="block text-xs text-gray-500 mb-1">Pitch: {formState.config.voice.pitch}</label>
+                                    <label className="block text-xs text-gray-500 mb-1">Pitch: {formState.config.voice.pitch?.toFixed(2)} st</label>
                                     <input
-                                        type="range" min="-12" max="12" step="1"
+                                        type="range" min="-0.75" max="0.75" step="0.05"
                                         className="w-full accent-blue-600"
                                         value={formState.config.voice.pitch}
                                         onChange={e => updateVoice({ pitch: parseFloat(e.target.value) })}
                                     />
+                                    <p className="text-xs text-gray-400 mt-1">Range -0.75 to +0.75 semitones</p>
                                 </div>
                             </div>
 

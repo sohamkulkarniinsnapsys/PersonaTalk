@@ -165,6 +165,8 @@ class WebRTCManager:
         # Track consecutive empty stop-check STT results during AI playback
         self._stopcheck_empty_count: int = 0
         self._last_stopcheck_ts: float = 0.0
+        # Conversation/Interview controller (initialized in handle_offer)
+        self.controller = None
 
     async def handle_offer(self, sdp, type_):
         # CRITICAL: Only handle the FIRST offer per manager
@@ -244,7 +246,7 @@ class WebRTCManager:
                             @database_sync_to_async
                             def get_persona_config():
                                 persona_obj = Persona.objects.get(slug=persona_slug)
-                                return persona_obj.config
+                                return persona_obj.upgraded_config  # Auto-upgrade old configs
                             
                             persona_config = await get_persona_config()
                             logger.info(f"Initialized persona '{persona_slug}' with config keys: {list(persona_config.keys())}")
@@ -254,13 +256,75 @@ class WebRTCManager:
                         
                         # Create session and controller with resolved persona
                         self.session = ConversationSession(self.room_id, persona_slug, persona_config)
-                        # Pass notify callback to controller so AI messages can be broadcast
-                        self.controller = ConversationController(
-                            self.session,
-                            self.orchestrator,
-                            self.queue_audio_output,
-                            notify_callback=self._notify
+
+                        # STRICT ISOLATION: route interviewer personas to InterviewerController
+                        meta = persona_config.get('metadata', {}) if persona_config else {}
+                        source_template = meta.get('source_template_id')
+                        flow_mode = persona_config.get('flow')
+
+                        is_interviewer_persona = (
+                            persona_slug == 'technical-interviewer' or
+                            source_template == 'technical-interviewer' or
+                            flow_mode == 'interview'
                         )
+
+                        if is_interviewer_persona:
+                            from ai_agent.models import Call
+                            from ai_agent.interviewer.controller import InterviewerController
+
+                            @database_sync_to_async
+                            def get_call_id_for_room():
+                                try:
+                                    return Call.objects.filter(room__id=self.room_id).order_by('-started_at').values_list('id', flat=True).first()
+                                except Exception:
+                                    return None
+
+                            call_id = await get_call_id_for_room()
+                            if not call_id:
+                                logger.error("No Call found for interviewer controller; cannot start interviewer flow")
+                                raise ValueError("Call not initialized for room")
+
+                            try:
+                                self.controller = InterviewerController(
+                                    self.room_id,
+                                    call_id,
+                                    persona_slug,
+                                    persona_config,
+                                    self.orchestrator,
+                                    self.queue_audio_output,
+                                    notify_callback=self._notify,
+                                    session=self.session,
+                                )
+                                logger.info(
+                                    "✅ Routed persona to InterviewerController | slug=%s | template=%s | flow=%s",
+                                    persona_slug,
+                                    source_template,
+                                    flow_mode,
+                                )
+                            except Exception as e:
+                                logger.error(f"❌ Failed to initialize InterviewerController: {e}", exc_info=True)
+                                # Fallback to normal conversation controller instead of crashing
+                                self.controller = ConversationController(
+                                    self.room_id,
+                                    persona_slug,
+                                    persona_config,
+                                    self.orchestrator,
+                                    self.queue_audio_output,
+                                    notify_callback=self._notify,
+                                    session=self.session,
+                                )
+                                logger.info(
+                                    "⚠️ Fell back to ConversationController due to initialization error | slug=%s",
+                                    persona_slug,
+                                )
+                        else:
+                            # Pass notify callback to controller so AI messages can be broadcast
+                            self.controller = ConversationController(
+                                self.session,
+                                self.orchestrator,
+                                self.queue_audio_output,
+                                notify_callback=self._notify
+                            )
                         
                         # Initialize persona-aware barge-in behavior
                         barge_behavior = get_behavior_for_persona(persona_slug, persona_config)

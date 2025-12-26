@@ -67,7 +67,7 @@ class AIOrchestrator:
         
         try:
             persona = await sync_to_async(Persona.objects.get)(slug=persona_slug)
-            persona_config = persona.config
+            persona_config = persona.upgraded_config  # Auto-upgrade old configs
         except Persona.DoesNotExist:
             logger.error(f"Persona {persona_slug} not found")
             return None

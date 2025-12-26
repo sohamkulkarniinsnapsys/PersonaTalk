@@ -1,3 +1,7 @@
+# Hugging Face datasets for downloading voice samples
+datasets>=2.19.0
+soundfile>=0.12.1
+requests>=2.31.0
 django>=5.0
 djangorestframework
 channels
@@ -13,5 +17,13 @@ jsonschema
 python-dotenv
 
 # Silero VAD for real-speech detection
-torch>=2.0.0
-torchaudio>=2.0.0
+# NOTE: For GPU support on Windows, install CUDA wheels manually:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchaudio==2.5.1+cu121
+# For CPU-only (slower TTS):
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1+cpu torchaudio==2.5.1+cpu
+torch==2.5.1
+torchaudio==2.5.1
+# TTS with XTTS v2 support - pinned dependencies for compatibility
+TTS>=0.22.0
+transformers==4.33.3
+# Prevent newer transformers that break BeamSearchScorer import

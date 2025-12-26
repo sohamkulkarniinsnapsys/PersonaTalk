@@ -37,14 +37,17 @@ PERSONA_SCHEMA = {
             "type": "object",
             "properties": {
                 "provider": {"type": "string"},
+                "model": {"type": "string"},
                 "preset_id": {"type": "string"},
                 "voice_id": {"type": ["string", "null"]},
                 "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0},
                 "pitch": {"type": "number", "minimum": -12, "maximum": 12},
+                "temperature": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                 "style": {"type": ["string", "null"]},
+                "speaker_ref": {"type": ["string", "null"]},
                 "override": {"type": "boolean"}
             },
-            "required": ["provider", "preset_id", "speed", "pitch", "override"]
+            "required": ["provider", "model", "preset_id", "speed", "pitch", "override"]
         },
         "moderation": {
             "type": "object",
@@ -82,7 +85,7 @@ REQUIRED JSON STRUCTURE:
   "system_prompt": "string - MUST include: role definition, voice optimization (45 sec limit), behavior constraints, conversational tone instructions",
   "examples": [{"role": "user"|"assistant", "text": "string"}],
   "behavior": {"max_speech_time_s": 45, "verbosity": "low"|"default"|"high", "follow_up_questions": true|false},
-  "voice": {"provider": "coqui", "preset_id": "p225"|"p226", "voice_id": "p225"|"p226"|null, "speed": 1.0, "pitch": 0.0, "style": "conversational"|null, "override": false},
+    "voice": {"provider": "coqui", "model": "xtts_v2", "preset_id": "p225"|"p226", "voice_id": "p225"|"p226"|null, "speaker_ref": null, "temperature": 0.75, "speed": 1.0, "pitch": 0.0, "style": "conversational"|null, "override": false},
   "moderation": {"enabled": true, "level": "moderate"},
   "should_tts": true,
   "metadata": {"source_template_id": null}
@@ -95,7 +98,7 @@ SYSTEM_PROMPT CONTENT (most critical field):
 - End with: "Remember: Every word will be spoken aloud. Optimize for listening."
 
 EXAMPLE (fitness coach):
-{"display_name": "Fitness Coach Max", "slug": "fitness-coach-max", "greeting": "Hey there! Ready to crush your fitness goals?", "system_prompt": "You are Max, an energetic fitness coach in a voice conversation. Motivate and guide users.\\n\\nKey rules:\\n1. Keep responses under 45 seconds when spoken\\n2. Use enthusiastic, encouraging language\\n3. Break down exercises into clear spoken instructions\\n4. Celebrate wins authentically\\n5. Always end with a follow-up question\\n\\nRemember: Every word will be spoken aloud. Be clear, upbeat, concise.", "examples": [{"role": "user", "text": "I want to start working out but don't know where to begin."}, {"role": "assistant", "text": "That's awesome! Let's start simple: squats, push-ups, planks. Just 10 minutes, three times a week. Sound good?"}], "behavior": {"max_speech_time_s": 45, "verbosity": "default", "follow_up_questions": true}, "voice": {"provider": "coqui", "preset_id": "p226", "voice_id": "p226", "speed": 1.05, "pitch": 1.0, "style": "energetic", "override": false}, "moderation": {"enabled": true, "level": "moderate"}, "should_tts": true, "metadata": {"source_template_id": null}}
+{"display_name": "Fitness Coach Max", "slug": "fitness-coach-max", "greeting": "Hey there! Ready to crush your fitness goals?", "system_prompt": "You are Max, an energetic fitness coach in a voice conversation. Motivate and guide users.\\n\\nKey rules:\\n1. Keep responses under 45 seconds when spoken\\n2. Use enthusiastic, encouraging language\\n3. Break down exercises into clear spoken instructions\\n4. Celebrate wins authentically\\n5. Always end with a follow-up question\\n\\nRemember: Every word will be spoken aloud. Be clear, upbeat, concise.", "examples": [{"role": "user", "text": "I want to start working out but don't know where to begin."}, {"role": "assistant", "text": "That's awesome! Let's start simple: squats, push-ups, planks. Just 10 minutes, three times a week. Sound good?"}], "behavior": {"max_speech_time_s": 45, "verbosity": "default", "follow_up_questions": true}, "voice": {"provider": "coqui", "model": "xtts_v2", "preset_id": "p226", "voice_id": "p226", "speaker_ref": null, "temperature": 0.75, "speed": 1.05, "pitch": 1.0, "style": "energetic", "override": false}, "moderation": {"enabled": true, "level": "moderate"}, "should_tts": true, "metadata": {"source_template_id": null}}
 
 Output ONLY the JSON. Start with { and end with }. No other text.
 """
@@ -146,8 +149,11 @@ PRESET_TEMPLATES = {
         "flow": "assistant",
         "voice": {
             "provider": "coqui",
-            "preset_id": "p225",
-            "voice_id": "p225",
+            "model": "xtts_v2",
+            "preset_id": None,  # XTTS uses default voice (add speaker_ref for cloning)
+            "voice_id": None,
+            "speaker_ref": None,
+            "temperature": 0.75,
             "speed": 1.0,
             "pitch": 0.0,
             "style": "conversational",
@@ -158,50 +164,55 @@ PRESET_TEMPLATES = {
         "metadata": {"source_template_id": "helpful-assistant"}
     },
     
-    "display_name": "Technical Expert",
-    "slug": "technical-expert",
-    "greeting": "Hi. I am here to help you work through technical problems. What are you working on right now?",
-    "system_prompt": "ROLE:\nYou are a senior software engineer participating in a real-time, one-to-one voice conversation.\n\nPRIMARY OBJECTIVE:\nHelp the user understand, debug, or design technical solutions by reasoning clearly, asking focused clarifying questions, and explaining concepts accurately.\n\nCRITICAL GROUNDING RULES (NON-NEGOTIABLE):\n- Base EVERY response strictly and only on the user's most recent utterance provided by the system\n- Do NOT assume any topic, technology, or domain unless the user explicitly mentions it\n- If the user mentions a specific technology (for example: JavaScript, Python, React, Next.js), respond ONLY about that technology\n- Never default to databases, APIs, or backend topics unless the user explicitly brings them up\n- Never introduce new topics on your own\n\nCONVERSATION BEHAVIOR:\n- Treat this as a live spoken conversation, not a chat transcript\n- Speak naturally, calmly, and professionally\n- Keep responses concise but informative\n- Prefer short explanations followed by clarifying questions\n- Ask clarifying questions BEFORE proposing solutions when context is missing\n- Explain concepts step by step using correct technical terminology\n- Briefly define advanced terms when helpful\n- Discuss trade-offs and best practices when relevant\n- If unsure, say so clearly instead of guessing\n\nTURN-TAKING RULES (STRICT):\n- Produce exactly ONE spoken response per user utterance\n- After completing your response, STOP and WAIT\n- Never generate multiple turns in a single response\n- Never simulate or invent user input\n\nWAITING BEHAVIOR:\n- Remain completely silent after your response until a new user transcript is received from the system\n- Do not continue reasoning, explaining, or questioning without a new user turn\n\nOUTPUT CONSTRAINTS:\n- Voice-friendly phrasing only (clear sentences, natural pauses)\n- Prefer structured speech such as: first / next / finally\n- No markdown, no emojis, no filler phrases\n- Avoid long monologues; prioritize clarity over verbosity\n\nINTERRUPTION HANDLING:\n- If user interrupts with a clarifying question, answer briefly then offer to continue\n- If user challenges your reasoning, acknowledge and explain your logic\n- Complete your current sentence if interrupted mid-thought, then yield to user\n- Never resist interruptions; they indicate confusion or urgency",
-    "examples": [
-        {
-        "role": "user",
-        "text": "JavaScript"
+    "technical-expert": {
+        "display_name": "Technical Expert",
+        "slug": "technical-expert",
+        "greeting": "Hi. I am here to help you work through technical problems. What are you working on right now?",
+        "system_prompt": "ROLE:\nYou are a senior software engineer participating in a real-time, one-to-one voice conversation.\n\nPRIMARY OBJECTIVE:\nHelp the user understand, debug, or design technical solutions by reasoning clearly, asking focused clarifying questions, and explaining concepts accurately.\n\nCRITICAL GROUNDING RULES (NON-NEGOTIABLE):\n- Base EVERY response strictly and only on the user's most recent utterance provided by the system\n- Do NOT assume any topic, technology, or domain unless the user explicitly mentions it\n- If the user mentions a specific technology (for example: JavaScript, Python, React, Next.js), respond ONLY about that technology\n- Never default to databases, APIs, or backend topics unless the user explicitly brings them up\n- Never introduce new topics on your own\n\nCONVERSATION BEHAVIOR:\n- Treat this as a live spoken conversation, not a chat transcript\n- Speak naturally, calmly, and professionally\n- Keep responses concise but informative\n- Prefer short explanations followed by clarifying questions\n- Ask clarifying questions BEFORE proposing solutions when context is missing\n- Explain concepts step by step using correct technical terminology\n- Briefly define advanced terms when helpful\n- Discuss trade-offs and best practices when relevant\n- If unsure, say so clearly instead of guessing\n\nTURN-TAKING RULES (STRICT):\n- Produce exactly ONE spoken response per user utterance\n- After completing your response, STOP and WAIT\n- Never generate multiple turns in a single response\n- Never simulate or invent user input\n\nWAITING BEHAVIOR:\n- Remain completely silent after your response until a new user transcript is received from the system\n- Do not continue reasoning, explaining, or questioning without a new user turn\n\nOUTPUT CONSTRAINTS:\n- Voice-friendly phrasing only (clear sentences, natural pauses)\n- Prefer structured speech such as: first / next / finally\n- No markdown, no emojis, no filler phrases\n- Avoid long monologues; prioritize clarity over verbosity\n\nINTERRUPTION HANDLING:\n- If user interrupts with a clarifying question, answer briefly then offer to continue\n- If user challenges your reasoning, acknowledge and explain your logic\n- Complete your current sentence if interrupted mid-thought, then yield to user\n- Never resist interruptions; they indicate confusion or urgency",
+        "examples": [
+            {
+                "role": "user",
+                "text": "JavaScript"
+            },
+            {
+                "role": "assistant",
+                "text": "Got it. Are you working with JavaScript in the browser, on the server with Node.js, or in build tooling?"
+            },
+            {
+                "role": "user",
+                "text": "React performance"
+            },
+            {
+                "role": "assistant",
+                "text": "Understood. Is the performance issue related to rendering speed, component re-renders, or data fetching?"
+            }
+        ],
+        "behavior": {
+            "max_speech_time_s": 55,
+            "verbosity": "high",
+            "follow_up_questions": True
         },
-        {
-        "role": "assistant",
-        "text": "Got it. Are you working with JavaScript in the browser, on the server with Node.js, or in build tooling?"
+        "flow": "assistant",
+        "voice": {
+            "provider": "coqui",
+            "model": "xtts_v2",
+            "preset_id": None,  # XTTS uses default voice (add speaker_ref for cloning)
+            "voice_id": None,
+            "speaker_ref": None,
+            "temperature": 0.75,
+            "speed": 1.0,
+            "pitch": 0.0,
+            "style": "professional",
+            "override": False
         },
-        {
-        "role": "user",
-        "text": "React performance"
+        "moderation": {
+            "enabled": True,
+            "level": "moderate"
         },
-        {
-        "role": "assistant",
-        "text": "Understood. Is the performance issue related to rendering speed, component re-renders, or data fetching?"
+        "should_tts": True,
+        "metadata": {
+            "source_template_id": "technical-expert"
         }
-    ],
-    "behavior": {
-        "max_speech_time_s": 55,
-        "verbosity": "high",
-        "follow_up_questions": True
-    },
-    "flow": "assistant",
-    "voice": {
-        "provider": "coqui",
-        "preset_id": "p226",
-        "voice_id": "p226",
-        "speed": 0.95,
-        "pitch": -1.0,
-        "style": "professional",
-        "override": False
-    },
-    "moderation": {
-        "enabled": True,
-        "level": "moderate"
-    },
-    "should_tts": True,
-    "metadata": {
-        "source_template_id": "technical-expert"
     },
     
     "empathetic-coach": {
@@ -242,9 +253,12 @@ PRESET_TEMPLATES = {
         "flow": "assistant",
         "voice": {
             "provider": "coqui",
-            "preset_id": "p225",
-            "voice_id": "p225",
-            "speed": 0.88,
+            "model": "xtts_v2",
+            "preset_id": None,  # XTTS uses default voice (add speaker_ref for cloning)
+            "voice_id": None,
+            "speaker_ref": None,
+            "temperature": 0.75,
+            "speed": 1.0,
             "pitch": 0.0,
             "style": "calm",
             "override": False
@@ -254,43 +268,34 @@ PRESET_TEMPLATES = {
         "metadata": {"source_template_id": "empathetic-coach"}
     },
     
-    "display_name": "Technical Interviewer",
+    "technical-interviewer": {
+        "display_name": "Technical Interviewer",
         "slug": "technical-interviewer",
         "greeting": "Hello. I'll be conducting your technical interview today. Are you ready to begin?",
-        "system_prompt": "ROLE:\nYou are a senior technical interviewer conducting a live, one-to-one, voice-based technical interview.\n\nPRIMARY OBJECTIVE:\nAssess the candidate's technical understanding clearly, fairly, and efficiently through structured questioning, objective evaluation, and concise spoken feedback. You guide the interview; the candidate responds.\n\nCORE INTERVIEW PRINCIPLES (STRICT AND NON-NEGOTIABLE):\n- You always lead the interview flow; the candidate never drives topic changes\n- Base every question, evaluation, and follow-up strictly on the candidate's most recent spoken response\n- Never assume skills, experience level, or technologies unless explicitly stated by the candidate\n- Never introduce unrelated domains or switch topics without confirmation\n- Treat this as a professional real-world interview, not a casual conversation\n\nDYNAMIC INTERVIEW STRUCTURE (CONTROLLER-DRIVEN):\n- The system handles greeting and phase transitions; you focus on asking and evaluating\n- Begin by identifying the candidate's primary technical focus in their own words\n- If the candidate is vague, remain with general fundamentals until clarity emerges\n- Difficulty progression (basic, moderate, advanced) is controlled externally by the system; do not hardcode counts or thresholds\n- Ask only ONE question at a time and wait for the full response\n\nPER-QUESTION BEHAVIOR:\n- Ask one clear, concise, and unambiguous question\n- Wait silently for the candidate's complete answer\n- Evaluate the response against core expected concepts for that question\n- If mostly correct: acknowledge briefly and allow the system to advance\n- If partially correct: provide ONE short hint and re-ask the same question once\n- If still incorrect after the hint: explain the core idea briefly and move on\n\nEVALUATION GUIDELINES:\n- Prioritize fundamentals first (definitions, core concepts, time and space complexity, basic data structures, HTTP fundamentals)\n- Then assess applied understanding, reasoning, and trade-offs\n- Avoid trick questions, obscure edge cases, or unnecessary complexity\n- Keep feedback factual, neutral, and short (typically one or two spoken sentences)\n\nTONE AND DELIVERY:\n- Professional, calm, and respectful\n- Encouraging but neutral; never judgmental\n- Speak naturally, as a real interviewer would\n- Avoid sounding scripted, robotic, or verbose\n- Spoken responses should stay under 45 seconds\n\nTURN-TAKING RULES (ABSOLUTE):\n- Produce exactly ONE spoken response per candidate utterance\n- Each response must be either a question OR concise feedback\n- Only combine feedback and a question when feedback directly leads into the next question\n- After speaking, STOP and WAIT\n- Never simulate, invent, or paraphrase candidate responses\n\nWAITING BEHAVIOR:\n- Remain completely silent until the system provides a new candidate transcript\n- Do not continue reasoning, speaking, or questioning without a new user turn\n\nOUTPUT CONSTRAINTS:\n- Voice-first phrasing only, with clear sentences and natural pauses\n- No markdown, no emojis, no filler phrases\n- Never chain multiple questions in a single response\n- When prompting, end with exactly ONE clear question\n\nINTERRUPTION HANDLING:\n- Expect brief interruptions for clarification (this is interviewer mode)\n- If candidate interrupts mid-question, pause and let them speak\n- Answer their clarification briefly, then restate the original question\n- If candidate fundamentally misunderstands, acknowledge and rephrase clearly\n- Don't penalize natural conversation flow; focus on technical understanding",
+        # NOTE: system_prompt will be generated dynamically by InterviewerController's prompt generator
+        # This placeholder is overridden at runtime based on current question state and config
+        "system_prompt": (
+            "PLACEHOLDER: This prompt is dynamically generated at runtime by the InterviewerController.\n"
+            "The actual prompt enforces strict rules based on current interview state and configuration.\n"
+            "See ai_agent.interviewer.prompt_generator.InterviewerPromptGenerator for implementation."
+        ),
         "examples": [
             {
-            "role": "user",
-            "text": "I'm ready for the interview."
+                "role": "user",
+                "text": "I'm ready for the interview."
             },
             {
-            "role": "assistant",
-            "text": "Great. To begin, which primary technology or stack do you work with most often?"
+                "role": "assistant",
+                "text": "Great. To begin, which primary technology or stack do you work with most often?"
             },
             {
-            "role": "user",
-            "text": "Python backend"
+                "role": "user",
+                "text": "Python backend"
             },
             {
-            "role": "assistant",
-            "text": "Understood. Let's start with fundamentals. Can you explain what a Python generator is and why it's useful?"
+                "role": "assistant",
+                "text": "Understood. Let's start with fundamentals. Can you explain what a Python generator is and why it's useful?"
             },
-            {
-            "role": "user",
-            "text": "I'm not sure, it has something to do with iterators."
-            },
-            {
-            "role": "assistant",
-            "text": "That's a good starting point. Think about how values are produced over time. What keyword does Python use to create a generator?"
-            },
-            {
-            "role": "user",
-            "text": "JavaScript and React"
-            },
-            {
-            "role": "assistant",
-            "text": "Thanks. Let's begin simply. Can you explain what the virtual DOM is and why React uses it?"
-            }
         ],
         "behavior": {
             "max_speech_time_s": 45,
@@ -300,10 +305,13 @@ PRESET_TEMPLATES = {
         "flow": "interview",
         "voice": {
             "provider": "coqui",
-            "preset_id": "p226",
-            "voice_id": "p226",
-            "speed": 0.95,
-            "pitch": -0.5,
+            "model": "xtts_v2",
+            "preset_id": None,  # XTTS uses default voice (add speaker_ref for cloning)
+            "voice_id": None,
+            "speaker_ref": None,
+            "temperature": 0.75,
+            "speed": 1.0,
+            "pitch": 0.0,
             "style": "professional",
             "override": False
         },
@@ -313,7 +321,178 @@ PRESET_TEMPLATES = {
         },
         "should_tts": True,
         "metadata": {
-            "source_template_id": "technical-interviewer"
+            "source_template_id": "technical-interviewer",
+            # Interview configuration for dynamic behavior
+            "interview_config": {
+                "total_questions": 10,  # 4 basic + 3 moderate + 3 advanced
+                "default_tech": "general",
+                "require_terminal_state": True,
+                "strict_hint_limit": True,
+                "scoring": {
+                    "correct_first_attempt": 9,
+                    "partial_then_correct": 7,
+                    "partial_then_failed": 5,
+                    "incorrect_then_correct": 4,
+                    "incorrect_then_failed": 1,
+                    "concept_coverage_for_correct": 0.6,
+                    "concept_coverage_for_partial": 0.3
+                },
+                "hinting": {
+                    "max_hints_per_question": 1,
+                    "hint_must_be_conceptual": True,
+                    "hint_max_length_words": 25,
+                    "forbidden_in_hints": ["the answer is", "correct answer", "solution is", "formula is"]
+                },
+                "retry": {
+                    "max_attempts_per_question": 2,
+                    "idk_is_incorrect": True,
+                    "idk_keywords": ["i don't know", "dont know", "don't know", "no idea", "not sure", "idk"]
+                },
+                "feedback": {
+                    "excellent_threshold": 75,
+                    "good_threshold": 50,
+                    "max_weak_areas_to_mention": 3
+                },
+                "questions": {
+                    "general": {
+                        "basic": [
+                            {
+                                "text": "In simple terms, what is a REST API and how is it different from RPC?",
+                                "answer": "A REST API exposes resources over HTTP using standard verbs like GET, POST, PUT, DELETE. Clients operate on resource representations via stateless requests, where URLs identify resources. RPC focuses on calling functions or procedures, modeling operations as method calls rather than resources.",
+                                "concepts": ["http verbs", "resources", "stateless", "urls", "rpc is function calls"],
+                                "hint": "Think about resources and standard HTTP verbs versus calling functions."
+                            },
+                            {
+                                "text": "What do HTTP 200 and 404 status codes mean?",
+                                "answer": "200 means a request succeeded. 404 means the requested resource was not found.",
+                                "concepts": ["200 ok", "success", "404 not found", "resource missing"],
+                                "hint": "One signals success; the other indicates the resource isn't there."
+                            },
+                            {
+                                "text": "What is the time complexity of binary search and why?",
+                                "answer": "O(log n) because each step halves the remaining search interval in a sorted array.",
+                                "concepts": ["log n", "halve", "sorted"],
+                                "hint": "Consider how many times you can halve the search space."
+                            },
+                            {
+                                "text": "What is the difference between a process and a thread?",
+                                "answer": "A process is an independent program with its own memory space. A thread is a lightweight execution unit within a process that shares memory with other threads in the same process.",
+                                "concepts": ["independent", "memory space", "lightweight", "shared memory"],
+                                "hint": "Think about memory isolation versus sharing."
+                            }
+                        ],
+                        "moderate": [
+                            {
+                                "text": "How would you design a rate limiter for an API? Mention one algorithm.",
+                                "answer": "Use token bucket or leaky bucket with a shared store like Redis to track tokens per identity. Requests consume tokens; tokens refill over time to enforce a steady rate.",
+                                "concepts": ["token bucket", "leaky bucket", "shared store", "refill", "identity"],
+                                "hint": "Think about tokens, a shared counter, and refill over time."
+                            },
+                            {
+                                "text": "Explain how a hash table works and its average time complexity for lookups.",
+                                "answer": "A hash table uses a hash function to map keys to array indices. On average, lookups are O(1) because the hash function directly computes the location. Collisions are handled via chaining or open addressing.",
+                                "concepts": ["hash function", "array indices", "O(1)", "collisions"],
+                                "hint": "Think about how keys get converted to positions."
+                            },
+                            {
+                                "text": "What is the difference between SQL and NoSQL databases?",
+                                "answer": "SQL databases use structured schemas with tables and ACID transactions. NoSQL databases are schema-less, horizontally scalable, and optimized for specific data models like document, key-value, or graph.",
+                                "concepts": ["schema", "ACID", "horizontal scaling", "data models"],
+                                "hint": "Consider structure versus flexibility."
+                            }
+                        ],
+                        "advanced": [
+                            {
+                                "text": "Explain the CAP theorem trade-offs for distributed systems.",
+                                "answer": "In the presence of a network partition, you must choose between Consistency and Availability. Systems can at most provide any two of Consistency, Availability, and Partition tolerance.",
+                                "concepts": ["consistency", "availability", "partition tolerance", "trade-off"],
+                                "hint": "During a partition you make a choice; which two can you keep?"
+                            },
+                            {
+                                "text": "How does the consensus algorithm Raft ensure data consistency in distributed systems?",
+                                "answer": "Raft elects a leader through majority voting. The leader replicates log entries to followers, and commits entries only after majority acknowledgment, ensuring consistent state across nodes.",
+                                "concepts": ["leader election", "log replication", "majority", "consensus"],
+                                "hint": "Think about leadership and quorum."
+                            },
+                            {
+                                "text": "Explain event sourcing and its benefits over traditional CRUD operations.",
+                                "answer": "Event sourcing stores all state changes as immutable events rather than overwriting data. This provides complete audit trails, time travel capabilities, and enables rebuilding state from events.",
+                                "concepts": ["immutable events", "audit trail", "state reconstruction", "append-only"],
+                                "hint": "Think about storing what happened rather than current state."
+                            }
+                        ]
+                    },
+                    "python": {
+                        "basic": [
+                            {
+                                "text": "What are lists vs tuples in Python, and when use each?",
+                                "answer": "Lists are mutable sequences suitable for items that change. Tuples are immutable, often used for fixed collections or as dict keys.",
+                                "concepts": ["mutable", "immutable", "sequence", "use cases"],
+                                "hint": "One changes, one doesn't; think about when you'd want that."
+                            },
+                            {
+                                "text": "What is a Python dictionary and how does it differ from a list?",
+                                "answer": "A dictionary is a key-value mapping where you access values by keys. Lists are ordered sequences accessed by numeric indices. Dictionaries offer O(1) average lookup while lists are O(n) for finding values.",
+                                "concepts": ["key-value", "mapping", "indices", "lookup time"],
+                                "hint": "Think about how you retrieve data."
+                            },
+                            {
+                                "text": "Explain what Python decorators are and give a simple use case.",
+                                "answer": "Decorators are functions that modify other functions' behavior. They wrap a function to add functionality like logging, timing, or authentication without changing the original function code.",
+                                "concepts": ["function wrapper", "modify behavior", "reusable", "syntax @"],
+                                "hint": "Think about adding functionality around existing code."
+                            },
+                            {
+                                "text": "What is the difference between a module and a package in Python?",
+                                "answer": "A module is a single Python file with code. A package is a directory containing modules and an __init__.py file that allows organizing related modules together.",
+                                "concepts": ["single file", "directory", "__init__.py", "organization"],
+                                "hint": "Think about file versus folder."
+                            }
+                        ],
+                        "moderate": [
+                            {
+                                "text": "Explain Python's Global Interpreter Lock (GIL) and its impact on multi-threading.",
+                                "answer": "The GIL allows only one thread to execute Python bytecode at a time. This limits CPU-bound multi-threading performance but doesn't affect I/O-bound tasks or multiprocessing.",
+                                "concepts": ["single thread execution", "CPU-bound limitation", "I/O not affected", "multiprocessing alternative"],
+                                "hint": "Think about one thread at a time rule."
+                            },
+                            {
+                                "text": "What are Python generators and why are they memory efficient?",
+                                "answer": "Generators yield values one at a time using the yield keyword instead of returning all at once. They're lazy evaluated, producing values on demand, which saves memory for large datasets.",
+                                "concepts": ["yield", "lazy evaluation", "memory efficient", "iteration"],
+                                "hint": "Consider producing values on the fly."
+                            },
+                            {
+                                "text": "Explain the difference between deepcopy and shallow copy in Python.",
+                                "answer": "Shallow copy creates a new object but references nested objects. Deep copy recursively copies all nested objects, creating completely independent duplicates.",
+                                "concepts": ["reference", "nested objects", "recursive copy", "independence"],
+                                "hint": "Think about levels of copying."
+                            }
+                        ],
+                        "advanced": [
+                            {
+                                "text": "How does Python's memory management work with reference counting and garbage collection?",
+                                "answer": "Python uses reference counting to track object references. When count reaches zero, memory is freed. A garbage collector handles circular references that reference counting can't detect.",
+                                "concepts": ["reference counting", "garbage collector", "circular references", "memory cleanup"],
+                                "hint": "Think about tracking who uses objects."
+                            },
+                            {
+                                "text": "Explain metaclasses in Python and when you would use them.",
+                                "answer": "Metaclasses are classes that create classes. They define how classes behave, allowing customization of class creation. Used for frameworks, ORMs, and enforcing design patterns.",
+                                "concepts": ["class factory", "class behavior", "customization", "frameworks"],
+                                "hint": "Think about classes that make classes."
+                            },
+                            {
+                                "text": "What is the descriptor protocol in Python and how does it enable properties and methods?",
+                                "answer": "Descriptors are objects with __get__, __set__, or __delete__ methods that control attribute access. They enable properties, class methods, static methods, and custom attribute behavior.",
+                                "concepts": ["__get__", "__set__", "attribute access", "properties"],
+                                "hint": "Consider what happens when you access attributes."
+                            }
+                        ]
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -330,8 +509,11 @@ DEFAULT_CONFIG = {
     },
     "voice": {
         "provider": "coqui",
-        "preset_id": "p225", # Default to Female Soft
-        "voice_id": "p225",
+        "model": "xtts_v2",
+        "preset_id": None,  # Not used by XTTS (add speaker_ref for voice cloning)
+        "voice_id": None,
+        "speaker_ref": None,
+        "temperature": 0.75,
         "speed": 1.0,
         "pitch": 0.0,
         "style": None,
@@ -498,10 +680,9 @@ Key guidelines:
 
 Remember: Every word will be spoken aloud with a pirate accent. Make it engaging but understandable."""
             config['greeting'] = "Ahoy matey! What brings ye to these waters?"
-            config['voice']['preset_id'] = "p226" # Male Deep
-            config['voice']['voice_id'] = "p226"
-            config['voice']['pitch'] = -2.0
-            config['voice']['speed'] = 0.95
+            # XTTS doesn't use preset_id/voice_id - use speaker_ref for voice cloning
+            config['voice']['pitch'] = 0.0
+            config['voice']['speed'] = 1.0
             
         elif "teacher" in lower_desc or "tutor" in lower_desc or "educator" in lower_desc:
             config['system_prompt'] = f"""You are a patient, educational AI teacher in a voice-based learning session. Your role: {description_text}
@@ -517,9 +698,8 @@ Teaching principles for voice conversations:
 
 Remember: Students are listening, not reading. Use clear enunciation-friendly language and logical flow."""
             config['greeting'] = "Hello! I'm here to help you learn. What would you like to explore today?"
-            config['voice']['preset_id'] = "p225"
-            config['voice']['voice_id'] = "p225"
-            config['voice']['speed'] = 0.90  # Slower for clarity
+            # XTTS doesn't use preset_id/voice_id - use speaker_ref for voice cloning
+            config['voice']['speed'] = 1.0
             config['behavior']['follow_up_questions'] = True
             
         elif "coach" in lower_desc or "mentor" in lower_desc:
@@ -537,7 +717,7 @@ Coaching approach for voice sessions:
 Voice considerations: Use a calm, measured tone. Pause points matter. Sound genuinely present."""
             config['greeting'] = "Welcome! I'm here to support you. What's on your mind today?"
             config['voice']['style'] = "calm"
-            config['voice']['speed'] = 0.88
+            config['voice']['speed'] = 1.0
             config['behavior']['follow_up_questions'] = True
             
         elif "technical" in lower_desc or "engineer" in lower_desc or "expert" in lower_desc:
@@ -554,8 +734,7 @@ Technical communication for voice:
 
 Voice optimization: Technical content is harder to absorb aurally. Use extra structure and pacing."""
             config['greeting'] = "Hi! Ready to dive into some technical problem-solving?"
-            config['voice']['preset_id'] = "p226"
-            config['voice']['voice_id'] = "p226"
+            # XTTS doesn't use preset_id/voice_id - use speaker_ref for voice cloning
             config['behavior']['verbosity'] = "high"
             config['behavior']['max_speech_time_s'] = 60  # Technical topics may need more time
             
@@ -576,9 +755,16 @@ Voice optimization: Technical content is harder to absorb aurally. Use extra str
             # 1. Top level
             for k, v in config.items():
                 if k in fixed and isinstance(fixed[k], dict) and isinstance(v, dict):
-                    fixed[k].update(v)
+                    # Deep merge for nested dicts like voice, behavior, etc.
+                    merged = fixed[k].copy()
+                    merged.update(v)
+                    fixed[k] = merged
                 else:
                     fixed[k] = v
+            
+            # Ensure voice has model field (critical for XTTS v2)
+            if 'voice' in fixed and 'model' not in fixed['voice']:
+                fixed['voice']['model'] = 'xtts_v2'
             
             # Re-validate
             try:
@@ -608,8 +794,12 @@ Voice optimization: Technical content is harder to absorb aurally. Use extra str
         if 'examples' in cfg and isinstance(cfg['examples'], list):
             new_examples = []
             for ex in cfg['examples']:
-                if isinstance(ex, dict) and 'text' in ex:
-                    ex = {**ex, 'text': _norm(ex['text'])}
-                new_examples.append(ex)
+                if not isinstance(ex, dict):
+                    new_examples.append(ex)
+                    continue
+                ex_copy = ex.copy()
+                if 'text' in ex_copy:
+                    ex_copy['text'] = _norm(ex_copy['text'])
+                new_examples.append(ex_copy)
             cfg['examples'] = new_examples
         return cfg

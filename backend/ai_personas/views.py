@@ -61,7 +61,7 @@ class PersonaViewSet(viewsets.ModelViewSet):
             return Response(cached)
 
         persona = self.get_object()
-        config = persona.config
+        config = persona.upgraded_config  # Use auto-upgraded config
         config['_meta'] = {
             'uuid': str(persona.uuid),
             'slug': persona.slug,
@@ -117,18 +117,23 @@ class PersonaViewSet(viewsets.ModelViewSet):
         Generate TTS preview for the persona's voice configuration.
         Expects JSON: { "text": "optional override", "voice_config": {...override...} }
         """
-        # Rate limiting: 1 req per 3 secons per user/ip
+        # Rate limiting: Prevent concurrent synthesis requests (XTTS v2 is resource-intensive)
         user_ip = request.META.get('REMOTE_ADDR')
         limit_key = f"tts_preview_limit_{user_ip}"
         if cache.get(limit_key):
-            return Response({"error": "Too many preview requests. Slow down."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
-        cache.set(limit_key, True, timeout=3)
+            return Response({
+                "error": "A synthesis is already in progress. Please wait for it to complete.",
+                "retry_after": 30
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        
+        # Lock for 30s (XTTS v2 can take 30-60s on first synthesis)
+        cache.set(limit_key, True, timeout=30)
         
         text = request.data.get('text', 'This is a preview of my voice.')
         
-        # Use persona config by default, allow override from request for live tweaking
+        # Use persona upgraded config by default, allow override from request for live tweaking
         persona = self.get_object()
-        voice_config = persona.config.get('voice', {})
+        voice_config = persona.upgraded_config.get('voice', {})
         
         # Merge overrides (shallow merge)
         if 'voice_config' in request.data:
@@ -163,7 +168,7 @@ class PersonaViewSet(viewsets.ModelViewSet):
         """
         text = request.data.get('text', 'Hello test.')
         persona = self.get_object()
-        voice_config = persona.config.get('voice', {})
+        voice_config = persona.upgraded_config.get('voice', {})
         
         # Merge overrides from request
         if 'voice_config' in request.data:

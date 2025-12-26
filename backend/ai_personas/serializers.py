@@ -16,6 +16,12 @@ class PersonaSerializer(serializers.ModelSerializer):
         read_only_fields = ['uuid', 'created_at', 'updated_at', 'version']
 
     def validate_config(self, value):
+        # Auto-upgrade old configs missing model field
+        if 'voice' in value and 'model' not in value.get('voice', {}):
+            value['voice']['model'] = 'xtts_v2'
+        if 'voice' in value and 'temperature' not in value.get('voice', {}):
+            value['voice']['temperature'] = 0.75
+        
         try:
             logger.info(f"Validating config: {value}")
             jsonschema.validate(instance=value, schema=PERSONA_SCHEMA)
@@ -23,6 +29,23 @@ class PersonaSerializer(serializers.ModelSerializer):
             logger.error(f"Config validation failed: {e.message}")
             logger.error(f"Failed config: {value}")
             raise serializers.ValidationError(f"Invalid config: {e.message}")
+
+        # Additional validation: ensure speaker_ref exists if provided
+        voice_cfg = (value or {}).get('voice', {}) or {}
+        speaker_ref = voice_cfg.get('speaker_ref')
+        if speaker_ref:
+            from pathlib import Path
+            from django.conf import settings
+
+            path = Path(speaker_ref)
+            if not path.is_absolute():
+                path = Path(settings.BASE_DIR) / speaker_ref
+            if not path.exists():
+                raise serializers.ValidationError({
+                    "voice": {
+                        "speaker_ref": f"speaker_ref file not found at {path}"
+                    }
+                })
         return value
 
 class PersonaVersionSerializer(serializers.ModelSerializer):

@@ -22,6 +22,20 @@ class Persona(models.Model):
     def __str__(self):
         return f"{self.display_name} (v{self.version})"
 
+    @property
+    def upgraded_config(self):
+        """Auto-upgrade config with missing fields for backward compatibility."""
+        config = self.config.copy() if self.config else {}
+        
+        # Ensure voice has model field (critical for XTTS v2)
+        if 'voice' in config:
+            if 'model' not in config['voice']:
+                config['voice']['model'] = 'xtts_v2'
+            if 'temperature' not in config['voice']:
+                config['voice']['temperature'] = 0.75
+        
+        return config
+
     def save(self, *args, **kwargs):
         # Create audit version on save if it exists
         if self.pk:
