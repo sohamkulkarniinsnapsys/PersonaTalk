@@ -59,30 +59,21 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center p-4 sm:p-8" style={{ backgroundColor: 'var(--color-bg-deep, #0f172a)' }}>
+    <div className="relative flex min-h-screen items-center justify-center p-4 sm:p-8 bg-slate-950 text-slate-50">
       {/* Background Elements */}
       <div className="fixed inset-0 overflow-hidden -z-10 pointer-events-none">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-600/20 rounded-full blur-[100px]" style={{ animation: 'pulse 4s ease-in-out infinite' }}></div>
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-teal-600/10 rounded-full blur-[100px]"></div>
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-500/20 rounded-full blur-[100px] animate-pulse"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-teal-500/10 rounded-full blur-[100px]"></div>
       </div>
 
       {/* Main Card */}
-      <main className="w-full max-w-4xl grid md:grid-cols-2 overflow-hidden min-h-[600px] rounded-2xl" style={{
-        backgroundColor: 'rgba(30, 41, 59, 0.7)',
-        backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255, 255, 255, 0.1)',
-        boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
-      }}>
+      <main className="ui-surface-strong w-full max-w-4xl grid md:grid-cols-2 overflow-hidden min-h-[600px] shadow-2xl shadow-black/40">
 
         {/* Left Panel: Brand / Visual */}
-        <div className="hidden md:flex flex-col justify-between p-10 relative" style={{
-          background: 'linear-gradient(135deg, rgba(79, 70, 229, 0.4) 0%, rgba(15, 23, 42, 0.4) 100%)'
-        }}>
+        <div className="hidden md:flex flex-col justify-between p-10 relative bg-gradient-to-br from-indigo-500/15 via-slate-900/10 to-slate-950/10">
           <div className="z-10">
             <div className="flex items-center gap-3 mb-6">
-              <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-lg" style={{
-                background: 'linear-gradient(135deg, #6366f1 0%, #14b8a6 100%)'
-              }}>
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-lg bg-gradient-to-br from-indigo-500 to-teal-500">
                 <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
               </div>
               <span className="text-2xl font-bold tracking-tight text-white">VideoConf AI</span>
@@ -97,7 +88,7 @@ export default function LoginPage() {
         </div>
 
         {/* Right Panel: Form */}
-        <div className="p-8 sm:p-12 flex flex-col justify-center relative" style={{ backgroundColor: 'rgba(30, 41, 59, 0.5)' }}>
+        <div className="p-8 sm:p-12 flex flex-col justify-center relative bg-slate-900/30">
           <div className="w-full max-w-sm mx-auto">
             <div className="mb-8 text-center md:text-left">
               <h2 className="text-3xl font-bold text-white mb-2">Welcome back</h2>
@@ -105,11 +96,7 @@ export default function LoginPage() {
             </div>
 
             {error && (
-              <div className="p-4 mb-6 rounded-lg text-sm font-medium" style={{
-                backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                color: '#fca5a5',
-                border: '1px solid rgba(239, 68, 68, 0.2)'
-              }}>
+              <div className="p-4 mb-6 rounded-xl text-sm font-medium border border-red-500/30 bg-red-500/10 text-red-200">
                 {error}
               </div>
             )}
@@ -125,11 +112,7 @@ export default function LoginPage() {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   required
-                  className={`peer w-full pt-6 pb-2 px-4 rounded-lg border transition-all focus:outline-none focus:border-indigo-500 ${errors.username ? 'border-red-500' : 'border-transparent'}`}
-                  style={{
-                    backgroundColor: '#334155',
-                    color: 'white',
-                  }}
+                  className={`peer w-full pt-6 pb-2 px-4 rounded-xl border transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 focus-visible:border-indigo-400 bg-slate-900/60 text-slate-50 ${errors.username ? 'border-red-500/60' : 'border-white/10'}`}
                 />
                 {errors.username && (
                   <p className="text-red-400 text-sm mt-1">{errors.username}</p>
@@ -146,16 +129,12 @@ export default function LoginPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
-                  className={`peer w-full pt-6 pb-2 px-4 pr-10 rounded-lg border transition-all focus:outline-none focus:border-indigo-500 ${errors.password ? 'border-red-500' : 'border-transparent'}`}
-                  style={{
-                    backgroundColor: '#334155',
-                    color: 'white',
-                  }}
+                  className={`peer w-full pt-6 pb-2 px-4 pr-10 rounded-xl border transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 focus-visible:border-indigo-400 bg-slate-900/60 text-slate-50 ${errors.password ? 'border-red-500/60' : 'border-white/10'}`}
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-3 text-slate-400 hover:text-white transition-colors"
+                  className="absolute right-3 top-3 text-slate-400 hover:text-slate-100 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 rounded-md"
                   aria-label={showPassword ? 'Hide password' : 'Show password'}
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
@@ -168,12 +147,7 @@ export default function LoginPage() {
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full py-3 px-6 rounded-lg font-semibold transition-all flex justify-center items-center gap-2"
-                style={{
-                  background: loading ? '#6366f1aa' : 'linear-gradient(135deg, #6366f1, #4f46e5)',
-                  color: 'white',
-                  boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
-                }}
+                className="ui-button-primary w-full py-3"
               >
                 {loading ? 'Signing in...' : 'Sign in'}
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -183,7 +157,7 @@ export default function LoginPage() {
             </form>
 
             <div className="mt-8 text-center text-sm text-slate-400">
-              Don't have an account?{' '}
+              Don&apos;t have an account?{' '}
               <Link href="/accounts/register" className="font-medium text-indigo-400 hover:text-indigo-300 transition-colors">
                 Create account
               </Link>

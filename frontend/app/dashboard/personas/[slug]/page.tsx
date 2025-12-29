@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { merge } from 'lodash'
 import { getCSRFToken } from '@/app/lib/auth'
@@ -60,6 +60,15 @@ type BehaviorConfig = {
     max_speech_time_s: number
     verbosity: "low" | "default" | "high"
     follow_up_questions: boolean
+}
+
+const isAbortError = (err: unknown): boolean => {
+    return (
+        typeof err === 'object' &&
+        err !== null &&
+        'name' in err &&
+        (err as { name?: unknown }).name === 'AbortError'
+    )
 }
 
 type PersonaConfig = {
@@ -263,8 +272,8 @@ export default function PersonaEditor() {
                 }
             })
 
-        } catch (e: any) {
-            setError(e.message)
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e))
         } finally {
             setGenerating(false)
         }
@@ -337,8 +346,8 @@ export default function PersonaEditor() {
                 alert("Saved!")
             }
 
-        } catch (e: any) {
-            setError(e.message)
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e))
         } finally {
             setSaving(false)
         }
@@ -382,11 +391,12 @@ export default function PersonaEditor() {
                 previewAudioRef.current.src = url
                 previewAudioRef.current.play()
             }
-        } catch (e: any) {
-            if (e.name === 'AbortError') {
+        } catch (e: unknown) {
+            if (isAbortError(e)) {
                 alert("Preview timed out after 3 minutes. The system may be overloaded. Try restarting the backend or switching to CPU mode.")
             } else {
-                alert(`Preview failed: ${e.message}`)
+                const message = e instanceof Error ? e.message : String(e)
+                alert(`Preview failed: ${message}`)
             }
         } finally {
             setPreviewingVoice(false)

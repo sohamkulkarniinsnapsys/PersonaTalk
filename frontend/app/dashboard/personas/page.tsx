@@ -58,18 +58,27 @@ export default function PersonaList() {
         }
     }
 
-    if (loading) return <div className="p-8 text-center text-gray-500">Loading Personas...</div>
+    if (loading) {
+        return (
+            <div className="min-h-screen bg-slate-950 text-slate-50">
+                <div className="ui-container py-10">
+                    <div className="ui-surface p-6 text-center text-slate-300">Loading personas…</div>
+                </div>
+            </div>
+        )
+    }
 
     return (
-        <div className="p-8 max-w-6xl mx-auto">
-            <div className="flex justify-between items-center mb-8">
+        <div className="min-h-screen bg-slate-950 text-slate-50">
+            <div className="ui-container py-10">
+            <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-center mb-8">
                 <div>
-                    <h1 className="text-3xl font-bold text-gray-900 dark:text-white">AI Personas</h1>
-                    <p className="text-gray-500 mt-1">Manage and design your AI assistants.</p>
+                    <h1 className="text-3xl font-bold tracking-tight">AI personas</h1>
+                    <p className="mt-1 text-sm text-slate-400">Manage and design your AI assistants.</p>
                 </div>
                 <Link
                     href="/dashboard/personas/new"
-                    className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium transition-colors"
+                    className="ui-button-primary"
                 >
                     Create New
                 </Link>
@@ -79,37 +88,39 @@ export default function PersonaList() {
                 {personas.map(persona => (
                     <div
                         key={persona.uuid}
-                        className="group block bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 hover:shadow-lg transition-all"
+                        className="group ui-surface p-6"
                     >
                         <div className="flex justify-between items-start mb-4">
-                            <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-xl">
+                            <div className="w-12 h-12 rounded-2xl bg-slate-900/70 border border-slate-700 flex items-center justify-center text-slate-100 font-semibold text-xl">
                                 {persona.display_name[0]}
                             </div>
-                            <span className={`px-2 py-1 rounded text-xs font-medium ${persona.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}`}>
+                            <span className={`ui-badge ${persona.is_active ? 'bg-slate-800/70 text-slate-200 border-slate-700' : 'bg-slate-900/40 text-slate-400 border-slate-800'}`}>
                                 {persona.is_active ? 'Active' : 'Inactive'}
                             </span>
                         </div>
 
-                        <h3 className="text-xl font-semibold mb-2 group-hover:text-blue-600 transition-colors">
-                            <Link href={`/dashboard/personas/${persona.slug}`} className="hover:underline">{persona.display_name}</Link>
+                        <h3 className="text-xl font-semibold mb-2">
+                            <Link href={`/dashboard/personas/${persona.slug}`} className="hover:underline underline-offset-4">
+                                {persona.display_name}
+                            </Link>
                         </h3>
 
-                        <p className="text-gray-500 text-sm line-clamp-3 mb-4 h-15">
+                        <p className="text-slate-400 text-sm line-clamp-3 mb-4">
                             {persona.description_text || "No description provided."}
                         </p>
 
-                        <div className="flex justify-between items-center text-xs text-gray-400 border-t pt-4 dark:border-gray-700">
+                        <div className="flex justify-between items-center text-xs text-slate-400 border-t border-slate-800 pt-4">
                             <div>
                                 <span className="mr-4">v{persona.version}</span>
                                 <span>{persona.slug}</span>
                             </div>
 
                             <div className="flex items-center gap-3">
-                                <Link href={`/dashboard/personas/${persona.slug}`} className="text-blue-600 hover:underline text-sm">View</Link>
+                                <Link href={`/dashboard/personas/${persona.slug}`} className="text-sm text-slate-200 hover:underline underline-offset-4">View</Link>
                                 <button
                                     onClick={() => handleDelete(persona.slug)}
                                     disabled={deleting === persona.slug}
-                                    className="text-red-600 hover:text-red-800 text-sm hover:underline cursor-pointer"
+                                    className="text-sm text-red-300 hover:underline underline-offset-4 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                                 >
                                     {deleting === persona.slug ? 'Deleting...' : 'Delete'}
                                 </button>
@@ -119,13 +130,14 @@ export default function PersonaList() {
                 ))}
 
                 {personas.length === 0 && (
-                    <div className="col-span-full text-center py-12 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-dashed border-gray-300">
-                        <p className="text-gray-500 mb-4">No personas found.</p>
-                        <Link href="/dashboard/personas/new" className="text-blue-600 hover:underline">
+                    <div className="col-span-full ui-surface p-10 text-center border-dashed border-slate-800">
+                        <p className="text-slate-400 mb-4">No personas found.</p>
+                        <Link href="/dashboard/personas/new" className="text-slate-200 hover:underline underline-offset-4">
                             Create your first persona
                         </Link>
                     </div>
                 )}
+            </div>
             </div>
         </div>
     )

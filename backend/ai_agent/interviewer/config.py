@@ -17,7 +17,7 @@ class ScoringRules:
     incorrect_then_failed: int = 1
     
     # Thresholds for classification
-    concept_coverage_for_correct: float = 0.6  # 60% of key concepts
+    concept_coverage_for_correct: float = 0.5  # 50% of key concepts (lenient)
     concept_coverage_for_partial: float = 0.3  # 30% for partial
 
 
@@ -59,7 +59,7 @@ class QuestionDefinition:
     concepts: List[str]  # Key concepts for evaluation
     hint: str  # High-level conceptual hint only
     tech: str = "general"
-    difficulty: str = "basic"
+    difficulty: str = "beginner"
 
 
 @dataclass
@@ -68,8 +68,13 @@ class InterviewConfig:
     
     This replaces all hard-coded behavior. Changes to interview flow
     require only config updates, not code changes.
+    
+    DYNAMIC GENERATION SUPPORT:
+    - If use_dynamic_generation=True, questions are generated at runtime by LLM
+    - If use_dynamic_generation=False, falls back to hard-coded 'questions' bank
     """
-    # Question bank organized by tech/difficulty
+    # Question bank organized by tech/difficulty (fallback for static mode)
+    # Keys: tech (domain) -> difficulty level -> list of questions
     questions: Dict[str, Dict[str, List[QuestionDefinition]]] = field(default_factory=dict)
     
     # Behavioral rules
@@ -79,8 +84,16 @@ class InterviewConfig:
     feedback: FeedbackRules = field(default_factory=FeedbackRules)
     
     # Interview structure
-    total_questions: int = 6
+    total_questions: int = 10  # 4 beginner + 3 intermediate + 3 advanced
     default_tech: str = "general"
+    
+    # Dynamic generation settings
+    use_dynamic_generation: bool = True  # Enable runtime question generation
+    difficulty_distribution: Dict[str, int] = field(default_factory=lambda: {
+        "beginner": 4,
+        "intermediate": 3,
+        "advanced": 3
+    })
     
     # Lifecycle enforcement
     require_terminal_state: bool = True  # Never skip unresolved questions
@@ -112,24 +125,33 @@ class InterviewConfig:
         retry_data = data.get("retry", {})
         feedback_data = data.get("feedback", {})
         
+        difficulty_dist = data.get("difficulty_distribution", {
+            "beginner": 4,
+            "intermediate": 3,
+            "advanced": 3
+        })
+        
         return cls(
             questions=questions,
             scoring=ScoringRules(**scoring_data) if scoring_data else ScoringRules(),
             hinting=HintingRules(**hinting_data) if hinting_data else HintingRules(),
             retry=RetryRules(**retry_data) if retry_data else RetryRules(),
             feedback=FeedbackRules(**feedback_data) if feedback_data else FeedbackRules(),
-            total_questions=data.get("total_questions", 6),
+            total_questions=data.get("total_questions", 10),
             default_tech=data.get("default_tech", "general"),
+            use_dynamic_generation=data.get("use_dynamic_generation", True),
+            difficulty_distribution=difficulty_dist,
             require_terminal_state=data.get("require_terminal_state", True),
             strict_hint_limit=data.get("strict_hint_limit", True),
         )
 
 
-# Default configuration - can be overridden per persona instance
+# Default configuration - uses dynamic generation by default
 DEFAULT_INTERVIEWER_CONFIG = InterviewConfig(
+    # Minimal fallback questions (only if dynamic generation fails)
     questions={
         "general": {
-            "basic": [
+            "beginner": [
                 QuestionDefinition(
                     text="In simple terms, what is a REST API and how is it different from RPC?",
                     answer=(
@@ -137,58 +159,134 @@ DEFAULT_INTERVIEWER_CONFIG = InterviewConfig(
                         "Clients operate on resource representations via stateless requests, where URLs identify resources. "
                         "RPC focuses on calling functions or procedures, modeling operations as method calls rather than resources."
                     ),
-                    concepts=["http verbs", "resources", "stateless", "urls", "rpc is function calls"],
-                    hint="Think about resources and standard HTTP verbs versus calling functions."
+                    concepts=["http verbs", "resources", "stateless", "urls", "rpc"],
+                    hint="Think about resources and standard HTTP verbs versus calling functions.",
+                    tech="general",
+                    difficulty="beginner"
                 ),
                 QuestionDefinition(
                     text="What do HTTP 200 and 404 status codes mean?",
                     answer="200 means a request succeeded. 404 means the requested resource was not found.",
                     concepts=["200 ok", "success", "404 not found", "resource missing"],
-                    hint="One signals success; the other indicates the resource isn't there."
+                    hint="One signals success; the other indicates the resource isn't there.",
+                    tech="general",
+                    difficulty="beginner"
                 ),
                 QuestionDefinition(
                     text="What is the time complexity of binary search and why?",
                     answer="O(log n) because each step halves the remaining search interval in a sorted array.",
-                    concepts=["log n", "halve", "sorted"],
-                    hint="Consider how many times you can halve the search space."
+                    concepts=["log n", "halve", "sorted", "divide"],
+                    hint="Consider how many times you can halve the search space.",
+                    tech="general",
+                    difficulty="beginner"
+                ),
+                QuestionDefinition(
+                    text="What is the difference between a process and a thread?",
+                    answer="A process is an independent program with its own memory space. A thread is a lightweight execution unit within a process that shares memory with other threads.",
+                    concepts=["process", "thread", "memory space", "independence", "shared memory"],
+                    hint="Think about memory isolation versus sharing.",
+                    tech="general",
+                    difficulty="beginner"
                 ),
             ],
-            "moderate": [
+            "intermediate": [
                 QuestionDefinition(
                     text="How would you design a rate limiter for an API? Mention one algorithm.",
                     answer=(
                         "Use token bucket or leaky bucket with a shared store like Redis to track tokens per identity. "
                         "Requests consume tokens; tokens refill over time to enforce a steady rate."
                     ),
-                    concepts=["token bucket", "leaky bucket", "shared store", "refill", "identity"],
-                    hint="Think about tokens, a shared counter, and refill over time."
+                    concepts=["token bucket", "leaky bucket", "shared store", "refill", "algorithm"],
+                    hint="Think about tokens, a shared counter, and refill over time.",
+                    tech="general",
+                    difficulty="intermediate"
+                ),
+                QuestionDefinition(
+                    text="Explain how a hash table works and its average time complexity for lookups.",
+                    answer="A hash table uses a hash function to map keys to array indices. On average, lookups are O(1). Collisions are handled via chaining or open addressing.",
+                    concepts=["hash function", "array indices", "O(1)", "collisions", "lookup"],
+                    hint="Think about how keys get converted to positions.",
+                    tech="general",
+                    difficulty="intermediate"
+                ),
+                QuestionDefinition(
+                    text="What is the difference between SQL and NoSQL databases?",
+                    answer="SQL uses structured schemas with tables and ACID transactions. NoSQL is schema-less, horizontally scalable, and optimized for specific data models like document, key-value, or graph.",
+                    concepts=["schema", "ACID", "scaling", "data models", "relational"],
+                    hint="Think about structure, transactions, and scaling approaches.",
+                    tech="general",
+                    difficulty="intermediate"
                 ),
             ],
             "advanced": [
                 QuestionDefinition(
                     text="Explain the CAP theorem trade-offs for distributed systems.",
                     answer=(
-                        "In the presence of a network partition, you must choose between Consistency and Availability. "
-                        "Systems can at most provide any two of Consistency, Availability, and Partition tolerance."
+                        "In the presence of network partition, choose between Consistency and Availability. "
+                        "Systems can provide at most two of: Consistency, Availability, Partition tolerance."
                     ),
-                    concepts=["consistency", "availability", "partition tolerance", "trade-off"],
-                    hint="During a partition you make a choice; which two can you keep?"
+                    concepts=["CAP theorem", "consistency", "availability", "partition tolerance", "trade-off"],
+                    hint="During a partition you make a choice; which two can you keep?",
+                    tech="general",
+                    difficulty="advanced"
+                ),
+                QuestionDefinition(
+                    text="What is the difference between optimistic and pessimistic locking?",
+                    answer="Optimistic assumes conflicts rare; checks before commit. Pessimistic locks before modification. Optimistic better for low-contention; pessimistic for high-contention.",
+                    concepts=["optimistic locking", "pessimistic locking", "conflict detection", "contention"],
+                    hint="Think about when you check for conflicts: before or after?",
+                    tech="general",
+                    difficulty="advanced"
+                ),
+                QuestionDefinition(
+                    text="How does garbage collection work in memory-managed languages?",
+                    answer="Garbage collection frees memory of unreachable objects automatically. Algorithms: mark-and-sweep (marks live, sweeps dead), generational GC (young collected more), reference counting (track references).",
+                    concepts=["mark-and-sweep", "generational", "reference counting", "reachability", "memory"],
+                    hint="Think about how the system knows which objects are still needed.",
+                    tech="general",
+                    difficulty="advanced"
                 ),
             ],
         },
         "python": {
-            "basic": [
+            "beginner": [
                 QuestionDefinition(
                     text="What are lists vs tuples in Python, and when use each?",
                     answer=(
                         "Lists are mutable sequences suitable for items that change. "
                         "Tuples are immutable, often used for fixed collections or as dict keys."
                     ),
-                    concepts=["mutable", "immutable", "sequence", "use cases"],
-                    hint="One changes, one doesn't; think about when you'd want that."
+                    concepts=["mutable", "immutable", "sequence", "use cases", "dict keys"],
+                    hint="One changes, one doesn't; think about when you'd want that.",
+                    tech="python",
+                    difficulty="beginner"
                 ),
             ]
         },
     },
-    total_questions=6,
+    # Behavioral and scoring rules
+    scoring=ScoringRules(
+        correct_first_attempt=9,
+        partial_then_correct=7,
+        partial_then_failed=5,
+        incorrect_then_correct=4,
+        incorrect_then_failed=1,
+        concept_coverage_for_correct=0.5,  # 50% = correct (lenient)
+        concept_coverage_for_partial=0.3
+    ),
+    hinting=HintingRules(),
+    retry=RetryRules(),
+    feedback=FeedbackRules(),
+    
+    # Interview structure with dynamic generation enabled
+    total_questions=10,  # 4 beginner + 3 intermediate + 3 advanced
+    default_tech="general",
+    use_dynamic_generation=True,  # ENABLE DYNAMIC QUESTION GENERATION
+    difficulty_distribution={
+        "beginner": 4,
+        "intermediate": 3,
+        "advanced": 3
+    },
+    require_terminal_state=True,
+    strict_hint_limit=True,
 )

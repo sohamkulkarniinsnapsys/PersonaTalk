@@ -322,7 +322,7 @@ export const useWebRTC = ({ roomId }: UseWebRTCProps) => {
                 } else if (data.type === 'agent_state') {
                     const s = String(data.state || '').toUpperCase();
                     console.log('🤖 Agent state:', s);
-                    // @ts-ignore - we trust backend states
+                    // @ts-expect-error - we trust backend states as string enums
                     setAgentState(s);
                 } else if (data.type === 'speaking_state') {
                     // NEW: Explicit speaking lifecycle events from backend

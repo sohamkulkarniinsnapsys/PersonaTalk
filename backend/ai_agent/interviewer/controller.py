@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import random
 from typing import Any, Dict, Optional
 
 from asgiref.sync import sync_to_async
@@ -10,6 +11,8 @@ from ai_agent.conversation import ConversationPhase, ConversationSession
 from .config import InterviewConfig, QuestionDefinition, DEFAULT_INTERVIEWER_CONFIG
 from .prompt_generator import InterviewerPromptGenerator
 from .evaluator import classify, score_for, Classification
+from .question_generator import DynamicQuestionGenerator, QuestionDeduplicator
+from .topic_taxonomy import get_taxonomy
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +37,10 @@ class InterviewerController:
         self._lock = asyncio.Lock()
         self._greeting_sent = False
         self._tech: str | None = None
-        self._stage: str = "basic"  # Current difficulty: basic/moderate/advanced
+        self._stage: str = "beginner"  # Current difficulty: beginner/intermediate/advanced
         self._question_index: int = 0
-        self._questions_per_difficulty = {"basic": 0, "moderate": 0, "advanced": 0}  # Track count per level
-        self._difficulty_limits = {"basic": 4, "moderate": 3, "advanced": 3}  # Max questions per level
+        self._questions_per_difficulty = {"beginner": 0, "intermediate": 0, "advanced": 0}  # Track count per level
+        self._difficulty_limits = {"beginner": 4, "intermediate": 3, "advanced": 3}  # Standard distribution
         self.session: ConversationSession | None = session
         self._ai_turn_seq: int = 0
         self._utterance_seq: int = 0
@@ -54,13 +57,33 @@ class InterviewerController:
         
         # Initialize dynamic prompt generator
         self.prompt_gen = InterviewerPromptGenerator(self.config)
+        
+        # Initialize dynamic question generator (uses LLM to generate questions at runtime)
+        session_seed = hash(self.room_id) % 1000000
+        self.question_generator = DynamicQuestionGenerator(
+            orchestrator=orchestrator,
+            session_seed=session_seed
+        )
+        
+        # Initialize question deduplicator to track generated questions
+        self.question_dedup = QuestionDeduplicator()
+        
+        # Pre-selected topics for this interview (selected on first user input)
+        self._selected_topics: list = []
+        
+        # Cache of generated questions for this interview
+        self._generated_questions_cache: Dict[str, QuestionDefinition] = {}
 
         # Prime WAIT_FOR_USER so VAD does not drop the first utterance
         if self.session:
             self.session.phase = ConversationPhase.WAIT_FOR_USER
             self.session.expected_user_utterance_id = self._next_utterance_id()
         
-        logger.info(f"Initialized interviewer with {self.config.total_questions} questions, {len(self.config.questions)} techs")
+        logger.info(
+            f"✅ Initialized interviewer (room={room_id}, "
+            f"dynamic_gen={self.config.use_dynamic_generation}, "
+            f"total_questions={self.config.total_questions})"
+        )
 
     # --------- Shared helpers (IDs, notifications) ---------
     def _next_ai_turn_id(self) -> str:
@@ -170,17 +193,108 @@ class InterviewerController:
     def _advance_index(self):
         # Increment count for current difficulty
         self._questions_per_difficulty[self._stage] += 1
-        logger.info(f"✅ Completed {self._stage} question. Progress: basic={self._questions_per_difficulty['basic']}/{self._difficulty_limits['basic']}, moderate={self._questions_per_difficulty['moderate']}/{self._difficulty_limits['moderate']}, advanced={self._questions_per_difficulty['advanced']}/{self._difficulty_limits['advanced']}")
+        logger.info(
+            f"✅ Completed {self._stage} question. Progress: "
+            f"beginner={self._questions_per_difficulty['beginner']}/{self._difficulty_limits['beginner']}, "
+            f"intermediate={self._questions_per_difficulty['intermediate']}/{self._difficulty_limits['intermediate']}, "
+            f"advanced={self._questions_per_difficulty['advanced']}/{self._difficulty_limits['advanced']}"
+        )
         self._question_index += 1
         
         # Check if current difficulty level is complete - move to next difficulty
         if self._questions_per_difficulty[self._stage] >= self._difficulty_limits[self._stage]:
-            if self._stage == "basic":
-                self._stage = "moderate"
-                logger.info(f"📈 Progressing to MODERATE difficulty (completed {self._questions_per_difficulty['basic']} basic questions)")
-            elif self._stage == "moderate":
+            if self._stage == "beginner":
+                self._stage = "intermediate"
+                logger.info(f"📈 Progressing to INTERMEDIATE difficulty (completed {self._questions_per_difficulty['beginner']} beginner questions)")
+            elif self._stage == "intermediate":
                 self._stage = "advanced"
-                logger.info(f"📈 Progressing to ADVANCED difficulty (completed {self._questions_per_difficulty['moderate']} moderate questions)")
+                logger.info(f"📈 Progressing to ADVANCED difficulty (completed {self._questions_per_difficulty['intermediate']} intermediate questions)")
+
+    # --------- Dynamic Question Generation ---------
+    async def _generate_next_dynamic_question(self) -> Optional[QuestionDefinition]:
+        """Generate the next interview question dynamically using LLM."""
+        try:
+            # On first question, select topics for the entire interview
+            if not self._selected_topics:
+                logger.info(f"🎲 Selecting topics for {self._stage} difficulty...")
+                domain = self._tech or self.config.default_tech
+                self._selected_topics = self.question_generator.select_random_topics(
+                    domain_slug=domain,
+                    count=self.config.total_questions,
+                    distribution=self.config.difficulty_distribution
+                )
+                if not self._selected_topics:
+                    logger.error(f"❌ No topics selected for domain '{domain}'")
+                    return None
+            
+            # Get next topic for current difficulty
+            current_difficulty_limit = self._difficulty_limits[self._stage]
+            current_difficulty_count = self._questions_per_difficulty[self._stage]
+            
+            # Filter topics for current difficulty and pick next
+            topics_for_difficulty = [
+                t for t in self._selected_topics 
+                if t.difficulty == self._stage
+            ]
+            
+            if not topics_for_difficulty:
+                logger.error(f"❌ No topics found for difficulty '{self._stage}'")
+                return None
+            
+            # Cycle through topics within difficulty (index within that difficulty level)
+            topic_idx = current_difficulty_count % len(topics_for_difficulty)
+            selected_topic = topics_for_difficulty[topic_idx]
+            
+            logger.info(f"📚 Generating {self._stage} question on topic: {selected_topic.name}")
+            
+            # Generate fresh question for this topic
+            qdef = await self.question_generator.generate_question(selected_topic)
+            
+            # Track generated question for deduplication
+            self.question_dedup.record_question(self._tech or "general", qdef.text)
+            
+            # Cache for later reference
+            cache_key = f"{self._stage}_{current_difficulty_count}"
+            self._generated_questions_cache[cache_key] = qdef
+            
+            return qdef
+            
+        except Exception as e:
+            logger.error(f"❌ Dynamic question generation failed: {e}", exc_info=True)
+            return None
+
+    def _get_static_question(self) -> Optional[QuestionDefinition]:
+        """Fallback: Get question from static question bank."""
+        tech = self._tech or self.config.default_tech
+        tech_bank = self.config.questions.get(tech, self.config.questions.get(self.config.default_tech, {}))
+        stage_set = tech_bank.get(self._stage, tech_bank.get("beginner", []))
+        
+        if not stage_set:
+            logger.warning(f"⚠️ No static questions found for tech={tech}, difficulty={self._stage}")
+            return None
+        
+        # Shuffle for variety using session seed
+        session_seed = hash(self.room_id + self._stage) % 10000
+        random.seed(session_seed)
+        shuffled = list(stage_set)
+        random.shuffle(shuffled)
+        
+        # Pick based on offset
+        offset = self._questions_per_difficulty[self._stage]
+        idx = offset % len(shuffled)
+        return shuffled[idx]
+
+    def _get_fallback_question(self) -> QuestionDefinition:
+        """Generic fallback question."""
+        difficulty = self._stage
+        return QuestionDefinition(
+            text=f"Explain a key concept related to {self._tech or 'software development'}.",
+            answer="Please provide a clear, detailed explanation demonstrating your understanding.",
+            concepts=["understanding", "explanation", "concepts"],
+            hint="Think about the fundamental ideas and how they work together.",
+            tech=self._tech or "general",
+            difficulty=difficulty
+        )
 
     @sync_to_async
     def _update_total_score(self, sess: InterviewSession):
@@ -263,22 +377,24 @@ class InterviewerController:
                 await self._final_evaluation()
                 return
             
-            # Use config-driven question bank
-            tech = self._tech or self.config.default_tech
-            tech_bank = self.config.questions.get(tech, self.config.questions.get(self.config.default_tech, {}))
-            stage_set = tech_bank.get(self._stage, tech_bank.get("basic", []))
+            # DYNAMIC GENERATION: Generate fresh question at runtime
+            if self.config.use_dynamic_generation:
+                qdef = await self._generate_next_dynamic_question()
+                if qdef is None:
+                    logger.error("❌ Dynamic question generation failed, using fallback")
+                    qdef = self._get_fallback_question()
+            else:
+                # Fallback: Use pre-defined question bank
+                qdef = self._get_static_question()
             
-            if not stage_set:
-                logger.error(f"No questions found for tech={tech}, stage={self._stage}")
+            if qdef is None:
+                logger.error("❌ No question available; cannot continue")
                 await self._speak("I apologize, but we've encountered a configuration issue. Let's end the interview here.")
                 return
             
-            # Pick next question from current difficulty level (cycle within available)
-            question_offset = self._questions_per_difficulty[self._stage]
-            q_idx = question_offset % len(stage_set)
-            qdef = stage_set[q_idx]
             q = await self._create_q_from_def(sess, qdef)
-            logger.info(f"❓ Asking {self._stage.upper()} question #{question_offset + 1}: {qdef.text[:60]}...")
+            question_num = total_completed + 1
+            logger.info(f"❓ Asking question #{question_num}/{total_limit}: {self._stage.upper()} - {qdef.text[:60]}...")
         
         # Generate dynamic system prompt with current question context
         system_prompt = self.prompt_gen.generate_system_prompt(

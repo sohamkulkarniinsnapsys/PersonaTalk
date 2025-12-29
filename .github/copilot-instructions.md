@@ -1,325 +1,227 @@
-﻿# AI Coding Agent Instructions (Concise)
+# AI Coding Agent Instructions
 
-Purpose: Real-time, turn-based AI voice calls with intelligent barge-in.
+**Purpose**: Real-time, turn-based AI voice calls with persona-aware barge-in interruption.
 
-Stack: Django + Channels/Daphne + aiortc (backend), Next.js (frontend).
-
-## Run & Test
-- Backend (ASGI only): `cd backend && daphne -p 8000 config.asgi:application`
-- Frontend: `cd frontend && npm run dev`
-- Windows setup: `./setup.ps1` (installs deps; ensure FFmpeg)
-- Key tests: `cd backend && python -m pytest test_deep_fixes.py -v` and `python test_audio_conditioning.py`
-
-## Environment
-- Backend env file: [backend/.env](backend/.env)
-  - `AI_MODE=mock|live`, `STT_PROVIDER=sarvam|whisper|groq`, `GROQ_API_KEY`, `SARVAM_API_KEY`, `TTS_PROVIDER=coqui`
-- Frontend env file: [frontend/.env.local](frontend/.env.local)
-  - `NEXT_PUBLIC_API_URL=http://localhost:8000`
-
-## Architecture & Key Files
-- WebRTC + VAD: [backend/ai_agent/webrtc.py](backend/ai_agent/webrtc.py)
-  - 48kHz s16 mono, 20ms frames; 2.5s silence → turn end; strict ASGI.
-- Conversation state: [backend/ai_agent/conversation.py](backend/ai_agent/conversation.py)
-  - `WAIT_FOR_USER` → `VALIDATING_UTTERANCE` → `PROCESSING_USER` → `AI_SPEAKING`; single STT per turn.
-- AI orchestration: [backend/ai_agent/ai_orchestrator.py](backend/ai_agent/ai_orchestrator.py)
-  - Provider abstraction for STT/LLM/TTS; persona-scoped history.
-- Barge-in (persona-aware): [backend/ai_agent/barge_in_state_machine.py](backend/ai_agent/barge_in_state_machine.py), [backend/ai_agent/persona_behaviors.py](backend/ai_agent/persona_behaviors.py)
-  - Stage 1 (speech energy/SNR) → Stage 2 (quick STT + heuristics); stop-words allowed mid TTS.
-- Audio conditioning: [backend/ai_agent/audio_conditioning.py](backend/ai_agent/audio_conditioning.py)
-  - 8-step pipeline (DC removal, HP/LP, noise suppression, AGC, speech-band emphasis) before STT.
-- Personas: [backend/ai_personas/builder.py](backend/ai_personas/builder.py)
-  - JSON schema, presets, voice config; `metadata.source_template_id` required.
-
-## Service Boundaries
-- WebSocket signaling: `/ws/signaling/{room_id}/` via Channels (backend).
-- Frontend: Next.js App Router; auth at `/`, dashboard at `/dashboard`.
-- Media: aiortc handles audio; TTS chunks streamed back (20ms).
-
-## Project-Specific Patterns
-- Use `database_sync_to_async` for ORM inside async (Channels/aiortc).
-- Bind `utterance_id` at capture time; reuse after STT to avoid race conditions.
-- Enforce 48kHz s16 mono; resample if needed; frames are 960 samples.
-- Turn-based only: no partial transcripts; single STT call per user turn.
-- Barge-in runs during AI speech; cancels TTS on valid interruption.
-
-## Critical Workflows & Debugging
-- Logs: watch for emoji `logger.info` markers (🔊, ✅, ❌, 🛑) around VAD/turn finalization.
-- Recordings: [backend/test_recordings](backend/test_recordings) store PCM/WAV per room for analysis.
-- Speaking state UI: see [frontend/app/hooks/useWebRTC.ts](frontend/app/hooks/useWebRTC.ts).
-- Migrations: `python manage.py makemigrations && python manage.py migrate`.
-- Common issues: never use `runserver` (WSGI), ensure FFmpeg for Coqui, set STT/TTS keys for `AI_MODE=live`.
-
-## Integration Points
-- Message types: `offer`, `answer`, `ice-candidate`, `transcript`, `agent_state`, `speaking_state`.
-- Provider registry: [backend/ai_agent/providers.py](backend/ai_agent/providers.py) and [backend/ai_agent/live_providers](backend/ai_agent/live_providers).
-
-Docs to consult: [VAD_ARCHITECTURE_FIX.md](VAD_ARCHITECTURE_FIX.md), [AUDIO_CONDITIONING_README.md](AUDIO_CONDITIONING_README.md), [INTELLIGENT_BARGE_IN_README.md](INTELLIGENT_BARGE_IN_README.md).
+**Stack**: Django 5.2 + Channels/Daphne + aiortc (backend), Next.js 15 (frontend).
 
 ---
 
-Legacy detailed guide (for reference) starts below.
+## Critical Commands
 
-# AI Coding Agent Instructions
-
-Project: Real-time AI voice conversation system. One-on-one video conferencing with intelligent barge-in and turn-based interaction.
-
-**Stack**: Django 5.2 + Channels/Daphne + aiortc (backend) | Next.js 16 + React 19 (frontend)
-
-## Quick Start
-- **Windows**: `./setup.ps1` | **Linux/macOS**: `chmod +x setup.sh && ./setup.sh`
-- **Backend** (ASGI required): `cd backend && daphne -p 8000 config.asgi:application`
-- **Frontend**: `cd frontend && npm run dev`
-- **Access**: http://localhost:3000 → redirects to `/dashboard` after auth
-- **Testing**: `cd backend && python -m pytest test_deep_fixes.py -v` (12 tests)
-
-## Environment Variables (Critical)
-Backend `.env` location: `backend/.env` (NOT root) - loaded by Django settings
-Frontend `.env.local` location: `frontend/.env.local` - loaded by Next.js
-
+**Backend** (ASGI only):  
 ```bash
-# Backend (backend/.env)
-AI_MODE=mock|live                    # mock=dev, live=production providers
-STT_PROVIDER=sarvam|whisper|groq    # Speech-to-text provider
-GROQ_API_KEY=your_key               # Required for live LLM
-SARVAM_API_KEY=your_key             # Required for Sarvam STT
-TTS_PROVIDER=coqui                   # Text-to-speech (requires FFmpeg)
-
-# Frontend (frontend/.env.local)
-NEXT_PUBLIC_API_URL=http://localhost:8000  # Backend API base URL
+cd backend && daphne -p 8000 config.asgi:application
 ```
+⚠️ **NEVER use `runserver`** — breaks WebSocket/aiortc entirely (WSGI-only).
+
+**Frontend**: `cd frontend && npm run dev`
+
+**Bootstrap** (installs FFmpeg + deps):
+- Windows: `.\setup.ps1`
+- Linux/macOS: `./setup.sh`
+
+**Tests** (validation order):
+```bash
+cd backend
+python -m pytest test_deep_fixes.py -v              # VAD/turn-taking FSM
+python test_audio_conditioning.py                   # 8-step audio pipeline
+python test_conversation_flow.py                    # State transitions
+```
+
+---
+
+## Environment & Dependencies
+
+**Backend** ([backend/.env](backend/.env)):
+```bash
+AI_MODE=mock|live                           # mock for dev; live requires API keys
+STT_PROVIDER=sarvam|whisper|groq            # Speech-to-text
+TTS_PROVIDER=coqui|sarvam                   # Text-to-speech
+GROQ_API_KEY=<key>                          # If STT_PROVIDER=groq
+SARVAM_API_KEY=<key>                        # If using Sarvam
+```
+
+**Frontend** ([frontend/.env.local](frontend/.env.local)):
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+**System Requirements**:  
+FFmpeg must be system-wide (required for Coqui TTS):
+- Windows: `winget install ffmpeg`
+- macOS: `brew install ffmpeg`
+- Linux: `sudo apt install ffmpeg`
+
+**Key Python Packages** (see [requirements.txt](backend/requirements.txt)):
+- `aiortc` (WebRTC media)
+- `daphne` (ASGI server)
+- `channels` (WebSocket)
+- `TTS` (Coqui XTTS v2 for audio synthesis)
+- `torch`, `torchaudio` (GPU acceleration optional)
+
+---
 
 ## Architecture Overview
 
-### Core Components
-1. **WebRTC Audio Pipeline** (`backend/ai_agent/webrtc.py`)
-   - Peer connection lifecycle (offer/answer via WebSocket)
-   - Voice Activity Detection (VAD): 2.5s silence threshold for turn-based interaction
-   - Audio I/O: 48kHz s16 mono, 20ms frames (960 samples), streamed via `RTCPeerConnection`
-   - **CRITICAL**: Use `database_sync_to_async` for ORM calls in async context
+### Core Data Model
+- **Room** (`ai_agent.models`): Conversation container (owner, is_active)
+- **Call**: Room session with selected Persona and transcript
+- **InterviewSession**: Persistent state for interview persona (score, completion)
+- **InterviewQuestionState**: Per-question lifecycle (eval, hints, scoring)
 
-2. **Conversation Controller** (`backend/ai_agent/conversation.py`)
-   - State machine: `WAIT_FOR_USER` → `VALIDATING_UTTERANCE` → `PROCESSING_USER` → `AI_SPEAKING`
-   - **Single STT call per turn** (no partial transcripts) after 2.5s continuous silence
-   - Semantic validation: blocks LLM on incomplete thoughts (ends with "and", "between", etc.)
-   - **Barge-in support**: User can interrupt AI mid-speech via stop words ("stop", "wait", "excuse me")
+### Core Components (Backend)
 
-3. **AI Orchestrator** (`backend/ai_agent/ai_orchestrator.py`)
-   - STT/LLM/TTS glue layer with provider abstraction
-   - Persona-isolated history (20 turns max) via `PersonaContext`
-   - Prompt builder includes system prompt, examples, and conversation history
+1. **WebRTC Media** ([webrtc.py](backend/ai_agent/webrtc.py))
+   - Audio: 48kHz s16 mono, 20ms frames (960 samples = 1920 bytes)
+   - VAD: 2.5s silence (`SILENCE_DURATION_MS`) triggers turn-end
+   - All async DB calls wrapped with `@database_sync_to_async`
 
-4. **Intelligent Barge-In** (`backend/ai_agent/barge_in_state_machine.py`, `persona_behaviors.py`)
-   - Two-stage pipeline: Speech validation (energy/SNR) → Query validation (STT + heuristics)
-   - **Persona-aware**: Technical interviewer (aggressive), Expert (conservative), Assistant (balanced)
-   - Stop-word detection runs DURING AI playback (ultra-low 300ms threshold, separate from barge-in)
-   - See [INTELLIGENT_BARGE_IN_README.md](../INTELLIGENT_BARGE_IN_README.md)
+2. **Conversation FSM** ([conversation.py](backend/ai_agent/conversation.py))  
+   - States: `WAIT_FOR_USER` → `VALIDATING_UTTERANCE` → `PROCESSING_USER` → `AI_SPEAKING`
+   - **Non-negotiable rule**: ONE STT call per complete turn (no partial transcripts)
+   - Question bank built-in for interview persona
 
-5. **Audio Conditioning** (`backend/ai_agent/audio_conditioning.py`)
-   - 8-step pipeline: DC removal → HP/LP filters → noise suppression → AGC → speech emphasis
-   - Runs AFTER utterance finalization, BEFORE STT call
-   - Continuous noise floor learning from non-speech frames
-   - See [AUDIO_CONDITIONING_README.md](../AUDIO_CONDITIONING_README.md)
+3. **AI Orchestration** ([ai_orchestrator.py](backend/ai_agent/ai_orchestrator.py))
+   - Provider-agnostic wrapper for STT/LLM/TTS
+   - Registry: [providers.py](backend/ai_agent/providers.py)
+   - Live providers: [live_providers/](backend/ai_agent/live_providers/)
+   - Persona-scoped history management
 
-6. **Personas** (`backend/ai_personas/builder.py`)
-   - Strict JSON schema validation (see `PERSONA_SCHEMA`)
-   - DB-backed configs with hardcoded presets (technical-interviewer, helpful-assistant, etc.)
-   - Voice settings: provider, preset_id (p225/p226), speed, pitch, style
-   - Flow modes: `interview` (AI leads) vs `assistant` (user leads)
+4. **Barge-In System** (persona-aware mid-TTS interruption)
+   - State machine: [barge_in_state_machine.py](backend/ai_agent/barge_in_state_machine.py)
+   - Persona behaviors: [persona_behaviors.py](backend/ai_agent/persona_behaviors.py)
+   - Stop-word detection: [stop_word_interruption.py](backend/ai_agent/stop_word_interruption.py)
+   - Two-stage validation: Energy/SNR → STT + heuristics
+
+5. **Audio Conditioning** ([audio_conditioning.py](backend/ai_agent/audio_conditioning.py))
+   - 8-step pipeline: DC removal → HP filter → LP filter → noise suppression → AGC → speech emphasis → peak norm → clip prevention
+   - Adaptive room noise learning
+   - Metrics: SNR, spectral flatness, clipping %
+
+6. **Interview Persona** ([interviewer/](backend/ai_agent/interviewer/))
+   - **Controller** ([controller.py](backend/ai_agent/interviewer/controller.py)): Session lifecycle
+   - **Evaluator** ([evaluator.py](backend/ai_agent/interviewer/evaluator.py)): Lenient scoring (50%+ coverage = correct)
+   - Q-randomization: `hash(room_id + stage)` seed per-session
+   - Scoring: 9 pts (correct first) → 7 (partial→correct) → 5 (partial→fail) → 4 (incorrect→correct) → 1 (fail)
+   - Max: 90 pts (10 Qs: 4 basic + 3 moderate + 3 advanced)
+
+7. **Persona Management** ([ai_personas/builder.py](backend/ai_personas/builder.py))
+   - JSON config + presets
+   - **Mandatory**: `metadata.source_template_id`
+   - Voice settings per persona
 
 ### Service Boundaries
-- **Backend**: Django ASGI app with Channels for WebSocket signaling (`/ws/signaling/{room_id}/`)
-- **Frontend**: Next.js App Router with React Server Components (auth at `/`, dashboard at `/dashboard`)
-- **Real-time**: aiortc handles WebRTC media, Channels handles signaling/control messages
-- **Database**: SQLite (dev), models in `ai_agent.models` (Call, Room) and `ai_personas.models` (Persona)
 
-### Data Flows
+- **WebSocket signaling**: `/ws/signaling/{room_id}/` (Django Channels → [CallConsumer](backend/ai_agent/consumers.py))
+- **Media streams**: aiortc (separate from signaling; peer connection)
+- **Message flow**: `offer` → `answer` → `ice-candidate` + `transcript`, `agent_state`, `speaking_state`
+- **Frontend hook**: [useWebRTC.ts](frontend/app/hooks/useWebRTC.ts) (peer connection + signaling management)
+- **Auth endpoints**: `/` (login), `/dashboard` (persona selector), `/dashboard/personas` (designer UI)
+
+---
+
+## Non-Negotiable Patterns
+
+### 1. Async/ORM Boundary
+**Rule**: Never call Django ORM inside aiortc/Channels async context.
+```python
+# ✅ Correct
+from channels.db import database_sync_to_async
+
+@database_sync_to_async
+def get_persona_config(room_id):
+    return Room.objects.select_related('call__persona').get(id=room_id)
+
+config = await get_persona_config(room_id)
+
+# ❌ Wrong — deadlock/crash
+config = Room.objects.get(id=room_id)  # Inside async coroutine
 ```
-Browser Microphone (getUserMedia)
-  ↓ WebRTC (offer/answer negotiation)
-RTCPeerConnection (aiortc backend)
-  ↓ 48kHz s16 mono frames
-VAD Detection (2.5s silence = turn end)
-  ↓ Complete utterance buffer
-Audio Conditioning (8-step pipeline)
-  ↓ Cleaned PCM audio
-STT Provider (Sarvam/Whisper/Groq)
-  ↓ Transcript text
-Conversation Controller (state machine + validation)
-  ↓ Complete, validated utterance
-LLM Provider (Groq/Mock)
-  ↓ AI response text
-TTS Provider (Coqui/Mock)
-  ↓ Synthesized audio (48kHz s16 mono)
-Queue to RTCPeerConnection (20ms chunks)
-  ↓ WebRTC streaming
-Browser Speakers
+
+### 2. Utterance ID Binding
+**Rule**: Bind `utterance_id` when audio capture starts; reuse after STT.
+```python
+# Capture start
+utterance_id = str(uuid.uuid4())
+self.active_utterance_id = utterance_id
+
+# After STT completes
+await conversation.process_user_utterance(
+    utterance_id=self.active_utterance_id,  # Same ID
+    transcript=text
+)
+```
+**Why**: Prevents race conditions where barge-in/state changes invalidate mid-processing utterances.
+
+### 3. Audio Format (Strict)
+**Rule**: All audio paths → 48kHz s16 mono.
+```python
+SAMPLE_RATE = 48000
+FRAME_DURATION = 0.02  # 20ms
+SAMPLES_PER_FRAME = int(SAMPLE_RATE * FRAME_DURATION)  # 960
+BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 1920 bytes
+```
+If input differs: resample immediately using `librosa` or `scipy.signal.resample`.
+
+### 4. Turn-Based STT Only
+**Rule**: No partial/streaming transcripts — one complete STT call per turn.
+```python
+# ✅ Correct: Buffer until 2.5s silence, then single STT
+if self.silence_frame_count >= SILENCE_FRAME_COUNT:
+    buffer_bytes = b''.join(self.audio_buffer)
+    text = await self.stt_provider.transcribe(buffer_bytes)
+
+# ❌ Wrong: Fragments user turn
+if len(self.audio_buffer) > threshold:
+    partial = await self.stt_provider.transcribe(...)
 ```
 
+### 5. Barge-In Activation Window
+**Rule**: Barge-in detection only active during `ConversationPhase.AI_SPEAKING`.
+```python
+if conversation.phase == ConversationPhase.AI_SPEAKING:
+    barge_in_sm.on_audio_frame(frame_bytes)
+    if barge_in_sm.state == BargeinState.ACCEPTED:
+        await tts_track.cancel_playback()
+```
 
+---
 
+## Debugging & Common Issues
 
-## Critical Developer Workflows
+### Log Markers (Quick Reference)
+- 🔊 VAD/turn decisions
+- ✅ Successful operations  
+- ❌ Errors/failures
+- 🛑 Critical stops (barge-in, turn abort)
+- 📊 Audio metrics (SNR, energy, spectral flatness)
 
-### Running Tests
+### Troubleshooting
+1. **Empty transcripts** → Low SNR buffer (check audio_conditioning.py logs)
+2. **No audio playback** → FFmpeg missing or Coqui TTS not installed
+3. **WebSocket crashes** → Using `runserver` instead of `daphne`
+4. **API key errors** → Missing `GROQ_API_KEY`/`SARVAM_API_KEY` with `AI_MODE=live`
+5. **Low interview scores** → Check evaluator thresholds in [evaluator.py](backend/ai_agent/interviewer/evaluator.py) (50%+ coverage = correct)
+6. **Same questions repeatedly** → Verify randomization seed in [controller.py](backend/ai_agent/interviewer/controller.py#L273)
+
+### Migrations
 ```bash
 cd backend
-python -m pytest                          # All tests
-python -m pytest test_deep_fixes.py -v    # Voice system validation (12 tests)
-python test_audio_conditioning.py         # Audio pipeline validation
+python manage.py makemigrations
+python manage.py migrate
 ```
+Remember: Still wrap ORM in `database_sync_to_async` in async code paths.
 
-### Starting Development Servers
-```bash
-# Terminal 1: Backend (MUST use Daphne, NOT Django runserver)
-cd backend
-daphne -p 8000 config.asgi:application
+### Audio Recordings & Artifacts
+- Per-room recordings: [backend/test_recordings/{room_id}/](backend/test_recordings/)
+- Includes: raw input, conditioned output, utterance segments
 
-# Terminal 2: Frontend
-cd frontend
-npm run dev
-```
-**Why Daphne?** Django `runserver` doesn't support ASGI/WebSocket. Using it breaks real-time audio.
+---
 
-### Debugging Audio Issues
-1. **Check VAD logs**: Look for "🔊 SINGLE STT CALL" in backend console (should appear ONCE per user turn)
-2. **Verify environment**: `AI_MODE=mock` should work out-of-box; `AI_MODE=live` requires API keys
-3. **Test recordings**: Audio saved to `backend/test_recordings/{room_id}/` as PCM+WAV for offline analysis
-4. **Check speaking states**: Frontend should show `speaking_state` events for user/AI (see `useWebRTC.ts`)
+## Essential Documentation
 
-### Common Build/Run Issues
-- **ModuleNotFoundError**: Install deps: `pip install -r requirements.txt` (backend) or `npm install` (frontend)
-- **WebSocket 403/404**: Verify Daphne is running, not Django runserver
-- **Empty transcripts**: Check `STT_PROVIDER` env var and API keys; review audio conditioning metrics in logs
-- **TTS fails**: Ensure FFmpeg installed system-wide (`winget install ffmpeg` on Windows)
-
-### Database Migrations
-```bash
-cd backend
-python manage.py makemigrations  # Generate migration files
-python manage.py migrate          # Apply to database
-```
-**CRITICAL**: Always use `@database_sync_to_async` when accessing Django ORM in async functions (WebRTC/Channels context).
-
-## Critical Patterns & Gotchas
-
-### 1. ASGI Server Requirement
-**Never use `python manage.py runserver`** - it only supports WSGI. Always use:
-```bash
-daphne -p 8000 config.asgi:application
-```
-This is the #1 cause of "WebSocket won't connect" issues.
-
-### 2. Async Boundaries (Database Access)
-Django ORM is synchronous but WebRTC/Channels code is async. **Always wrap ORM calls**:
-```python
-from asgiref.sync import sync_to_async
-
-# WRONG - will hang/crash:
-persona = Persona.objects.get(slug=slug)
-
-# RIGHT - async wrapper:
-@sync_to_async
-def get_persona():
-    return Persona.objects.get(slug=slug)
-
-persona = await get_persona()
-```
-See examples in `webrtc.py` lines 215-240 (handle_offer method).
-
-### 3. utterance_id Binding
-**Bind utterance IDs to audio buffers at capture time**, not at STT completion:
-```python
-# Capture ID BEFORE async STT call
-current_utterance_id = expected_id or str(uuid.uuid4())
-audio_buffer = bytes(buffer)
-
-# Later, use bound ID (not dynamic expected_id)
-await controller.handle_user_utterance(transcript, current_utterance_id)
-```
-See `webrtc.py` lines 555-595 for production pattern. This prevents race conditions when STT takes 300-600ms.
-
-### 4. Audio Frame Format
-**All audio must be 48kHz s16 mono**:
-- `s16` = 16-bit signed integer PCM
-- 20ms frames = 960 samples/frame = 1920 bytes/frame
-- Resampling required if mic provides 44.1kHz or other rates
-
-See `audio_conditioning.py` for normalization pipeline.
-
-### 5. Turn-Based vs Streaming
-This system is **turn-based** (like ChatGPT voice mode), NOT continuous/streaming:
-- User speaks → 2.5s silence → **ONE** STT call → AI responds
-- No partial transcripts during speech
-- Barge-in is explicit interruption, not parallel streams
-
-## Common Pitfalls & Solutions
-
-### Issue: "User gets cut off mid-sentence"
-**Cause**: `SILENCE_DURATION_MS` too low (was 800ms, needs 2500ms)
-**Fix**: Check `webrtc.py` line ~270, ensure `SILENCE_DURATION_MS = 2500`
-**Why**: Natural pauses (1-2s) are part of utterances, not turn boundaries
-
-### Issue: "Duplicate STT calls for same audio"
-**Cause**: `utterance_in_flight` flag not set/checked
-**Fix**: See `webrtc.py` lines 320-360 for correct pattern:
-```python
-if utterance_in_flight:
-    continue  # Skip duplicate processing
-utterance_in_flight = True
-# ... STT call ...
-finally:
-    utterance_in_flight = False
-```
-
-### Issue: "utterance_id mismatch errors"
-**Cause**: Using dynamic `expected_id` instead of bound ID
-**Fix**: Capture `current_utterance_id = expected_id` BEFORE async STT, use captured value after
-
-### Issue: "Empty transcripts from Sarvam/STT"
-**Causes**:
-1. Audio buffer too short (< 1.5s)
-2. Low SNR (< -10 dB) or high spectral flatness (> 0.85)
-3. Missing audio conditioning
-
-**Fix**: Check logs for "Audio Metrics" - SNR, duration, spectral_flatness. See `AUDIO_CONDITIONING_README.md`.
-
-### Issue: "TTS blocks user from speaking"
-**Cause**: `ai_is_speaking = True` disables VAD
-**Fix**: Barge-in detection now runs DURING AI playback (lines 375-420 in `webrtc.py`). User speech triggers immediate TTS cancel.
-
-## Where to Extend
-
-### Adding New STT/LLM/TTS Providers
-1. Implement interface in `backend/ai_agent/interfaces.py`
-2. Add provider class in `backend/ai_agent/live_providers/`
-3. Register in `backend/ai_agent/providers.py` `get_providers()` function
-4. Add env var for API key in `backend/.env`
-
-Example: See `GroqWhisperSTT` in `live_providers/stt.py` lines 80-150.
-
-### Adding Custom Personas
-1. Define preset in `backend/ai_personas/builder.py` `PRESET_TEMPLATES` dict
-2. Create DB entry via `/api/personas/` endpoint
-3. **CRITICAL**: Set `metadata.source_template_id` to match preset key
-4. Optionally add barge-in behavior in `persona_behaviors.py`
-
-### Modifying WebSocket Signaling
-- **Backend**: Edit `backend/ai_agent/consumers.py` (CallConsumer class)
-- **Frontend**: Edit `frontend/app/hooks/useWebRTC.ts` (websocket.onmessage handler)
-- **Message types**: `offer`, `answer`, `ice-candidate`, `transcript`, `agent_state`, `speaking_state`
-
-## Documentation Map
-
-| Topic | File | Lines | Purpose |
-|-------|------|-------|---------|
-| **Architecture Overview** | DEEP_FIXES_ARCHITECTURAL_CHANGES.md | 870 | Complete system design decisions |
-| **VAD & Turn-Taking** | VAD_ARCHITECTURE_FIX.md | 280 | Why 2.5s silence threshold |
-| **Audio Pipeline** | AUDIO_CONDITIONING_README.md | 350 | 8-step conditioning details |
-| **Barge-In System** | INTELLIGENT_BARGE_IN_README.md | 450 | Two-stage interruption validation |
-| **Stop-Word Detection** | STOP_WORD_IMPLEMENTATION_COMPLETE.md | 520 | Ultra-low latency control commands |
-| **Persona System** | backend/ai_personas/builder.py | 450 | Schema, templates, voice configs |
-| **Testing Guide** | TESTING_GUIDE.md | 280 | Production fix validation |
-
-**Pro tip**: Search codebase for `logger.info` with emojis (🔊, ✅, ❌, 🛑) - these mark critical decision points.
-
-
+- [VAD_ARCHITECTURE_FIX.md](VAD_ARCHITECTURE_FIX.md) - Turn-taking rules, 2.5s silence threshold rationale
+- [AUDIO_CONDITIONING_README.md](AUDIO_CONDITIONING_README.md) - 8-step pipeline details, metrics
+- [INTELLIGENT_BARGE_IN_README.md](INTELLIGENT_BARGE_IN_README.md) - Persona-aware interruption logic
+- [STOP_WORD_IMPLEMENTATION_COMPLETE.md](STOP_WORD_IMPLEMENTATION_COMPLETE.md) - Mid-TTS interruption patterns
+- [README.md](README.md) - Setup quickstart, architecture overview

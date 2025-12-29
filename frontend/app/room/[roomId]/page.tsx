@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, use, useState } from 'react';
+import React, { useEffect, useRef, use } from 'react';
 import { useWebRTC } from '@/app/hooks/useWebRTC';
 import { MediaControls } from '@/components/MediaControls';
 import { AIAnimation } from '@/components/AIAnimation';
@@ -21,7 +21,6 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
         persona,
         aiSpeaking,
         userSpeaking, // NEW: Get userSpeaking from backend events instead of audio analysis
-        setAiSpeaking,
         transcript,
         aiPlaybackStartedTurns,
         aiPlaybackCanceledTurns
@@ -67,7 +66,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
     const personaName = persona?.display_name || 'AI Persona';
 
     return (
-        <div className="relative h-screen w-full bg-black overflow-hidden flex flex-col items-center justify-center text-white">
+        <div className="relative h-screen w-full bg-slate-950 overflow-hidden flex flex-col items-center justify-center text-slate-50">
 
             {/* Background / AI Animation (Center) */}
             <div className="absolute inset-0 flex items-center justify-center z-0">
@@ -78,12 +77,12 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
                         personaName={personaName} 
                     />
 
-                    <p className="text-gray-400 mt-8 capitalize">Status: {connectionStatus}</p>
+                    <p className="text-slate-400 mt-8 capitalize">Status: {connectionStatus}</p>
 
                     {showReconnect && (
                         <button
                             onClick={reconnect}
-                            className="mt-6 px-6 py-2 bg-white text-black font-semibold rounded-full hover:bg-gray-200 transition-colors z-50 pointer-events-auto"
+                            className="mt-6 ui-button-primary z-50 pointer-events-auto"
                         >
                             Reconnect
                         </button>
@@ -95,7 +94,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
             <audio ref={remoteAudioRef} autoPlay />
 
             {/* Local Video (PiP) - Top Left */}
-            <div className="absolute top-4 left-4 w-48 h-36 bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800 z-10">
+            <div className="absolute top-4 left-4 w-48 h-36 bg-slate-900/40 rounded-xl overflow-hidden shadow-2xl border border-slate-800 z-10">
                 <video
                     ref={localVideoRef}
                     autoPlay
@@ -105,7 +104,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
                 />
                 {isVideoOff && (
                     <div className="flex items-center justify-center w-full h-full">
-                        <span className="text-xs text-gray-500">Camera Off</span>
+                        <span className="text-xs text-slate-400">Camera Off</span>
                     </div>
                 )}
             </div>
@@ -122,7 +121,7 @@ export default function CallRoom({ params }: { params: Promise<{ roomId: string 
             </div>
 
             {/* Transcript Sidebar - Right */}
-            <div className="absolute top-0 right-0 h-full w-96 bg-black/50 backdrop-blur border-l border-gray-800 z-20">
+            <div className="absolute top-0 right-0 h-full w-96 bg-slate-950/40 backdrop-blur border-l border-slate-800 z-20">
                 <TranscriptPanel
                     items={transcript}
                     personaName={personaName}

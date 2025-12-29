@@ -53,9 +53,13 @@ yarn-error.log*
 
 # env
 *.env
-*.env.local
+*.env.*
+.env
+.env.local
 
 *.md
 *.txt
+
+z
 
 test_recordings

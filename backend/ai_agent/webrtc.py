@@ -165,6 +165,10 @@ class WebRTCManager:
         # Track consecutive empty stop-check STT results during AI playback
         self._stopcheck_empty_count: int = 0
         self._last_stopcheck_ts: float = 0.0
+        # Cooldown to avoid thrashing stop-check STT on ultra-low SNR during AI speech
+        self._stopcheck_low_snr_until: float = 0.0
+        # Debounce repeated utterance finalizations
+        self._last_finalize_ts: float = 0.0
         # Conversation/Interview controller (initialized in handle_offer)
         self.controller = None
 
@@ -506,6 +510,14 @@ class WebRTCManager:
                             logger.info(f"⏱️  [GUARD] Skipping stop-check: still in guard window ({self._ai_playback_guard_deadline - current_time:.2f}s remaining)")
                         continue
 
+                    # Cooldown after repeated low-SNR attempts to avoid spamming STT with AI audio
+                    if current_time < self._stopcheck_low_snr_until:
+                        if frame_count % 50 == 0:
+                            logger.info(
+                                f"⏱️  [stop-debug] Cooldown active ({self._stopcheck_low_snr_until - current_time:.2f}s remaining); skipping stop-check"
+                            )
+                        continue
+
                     # Always accumulate a short rolling buffer during AI playback for stop-word detection.
                     self._stopword_buffer.extend(raw_bytes)
                     max_stop_bytes = int(2_000 * 48000 * 2 / 1000)  # ~2s
@@ -550,6 +562,8 @@ class WebRTCManager:
                                     prep_metrics.get("snr_db", 0.0),
                                     prep_metrics.get("rms", 0.0),
                                 )
+                                # Back off for a short period to avoid hammering STT with AI audio
+                                self._stopcheck_low_snr_until = time.time() + 1.0
                                 self.stop_interruptor.reset_check_timer()
                                 self._stopword_buffer.clear()
                                 self._stopcheck_empty_count = 0
@@ -884,6 +898,18 @@ class WebRTCManager:
                 current_utterance_id = expected_id or str(uuid.uuid4())
                 utterance_in_flight = True
 
+                now_ts = time.time()
+                if now_ts - self._last_finalize_ts < 0.75:
+                    logger.info(
+                        f"🛑 Debounced duplicate end-of-utterance (ID={current_utterance_id}); skipping finalize within 750ms window"
+                    )
+                    buffer.clear()
+                    silence_frames = 0
+                    consecutive_start_frames = 0
+                    utterance_in_flight = False
+                    continue
+                self._last_finalize_ts = now_ts
+
                 logger.info("")
                 logger.info("═══════════════════════════════════════════════════════════")
                 logger.info("🔊 SINGLE STT CALL - Complete user turn captured")
@@ -944,18 +970,10 @@ class WebRTCManager:
                             )
                         else:
                             logger.warning(
-                                "🛑 Prepared audio below floor (dur/rms/snr). Requesting repeat without STT call."
+                                "🛑 Prepared audio below floor (dur/rms/snr). Skipping this utterance silently - user will naturally rephrase."
                             )
-                            await self._notify(
-                                {
-                                    "type": "transcript",
-                                    "role": "assistant",
-                                    "text": "I couldn't hear that clearly. Could you please repeat?",
-                                    "turnId": self.session.last_ai_turn_id,
-                                    "roomId": self.room_id,
-                                    "timestamp": time.time(),
-                                }
-                            )
+                            # Don't send "I couldn't hear" message - just skip and wait for clearer audio
+                            # User's natural flow: speak again louder/clearer without AI interrupting
                             utterance_in_flight = False
                             await self.controller._set_waiting_for_user()
                             continue

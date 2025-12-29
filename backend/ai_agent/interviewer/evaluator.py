@@ -48,6 +48,8 @@ def classify(
 ) -> Dict:
     """Classify into correct/partial/incorrect with config-driven rules.
     
+    ENHANCED: More lenient evaluation - considers semantic similarity and directional correctness.
+    
     Args:
         user_answer: Candidate's response
         reference_answer: Canonical correct answer
@@ -63,17 +65,33 @@ def classify(
     total_concepts = len(concepts or [1])
     coverage = hits / max(total_concepts, 1)
     
-    if coverage >= correct_threshold:
+    # ENHANCED: Be more lenient - 50% coverage is acceptable for "correct" in many cases
+    # Original threshold was too strict (60%)
+    lenient_correct_threshold = max(0.5, correct_threshold - 0.1)  # Lower by 10%
+    
+    if coverage >= lenient_correct_threshold:
         label = Classification.CORRECT
     elif coverage >= partial_threshold:
         label = Classification.PARTIAL
     else:
-        # allow semantic overlap via inclusion of key phrases from reference
+        # ENHANCED: Better semantic overlap detection
         ref = _normalize(reference_answer)
-        overlap = 1 if any(tok in s for tok in ref.split()[:5]) else 0
-        label = Classification.PARTIAL if overlap else Classification.INCORRECT
+        # Check for meaningful phrase overlap (not just single words)
+        ref_tokens = ref.split()
+        # Look for 2-3 word phrases, not just single words
+        overlap_score = 0
+        for i in range(len(ref_tokens) - 1):
+            bigram = " ".join(ref_tokens[i:i+2])
+            if bigram in s:
+                overlap_score += 2
+        # Also check single important words
+        for tok in ref_tokens[:5]:
+            if len(tok) > 3 and tok in s:  # Only meaningful words (>3 chars)
+                overlap_score += 1
+        
+        label = Classification.PARTIAL if overlap_score >= 2 else Classification.INCORRECT
     
-    return {"label": label, "hits": hits, "coverage": coverage, "needed": int(total_concepts * correct_threshold)}
+    return {"label": label, "hits": hits, "coverage": coverage, "needed": int(total_concepts * lenient_correct_threshold)}
 
 
 def score_for(
